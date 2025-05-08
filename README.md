@@ -47,4 +47,4 @@ Adults with documented IMV periods >24 hours. There are no date constraints.
 3. Run [CODE](https://github.com/acortizmd/CLIF_Deep_Sedation_Language/tree/main/code) starting with 00_cohort_id
 4. Deposit results:
 
-Please deposit your "final_data" folder in this [box folder](https://uchicago.app.box.com/s/1g90ydgtwkkewrmgsowd98j1ys4mpgk4)
+Please deposit your "final_data" folder in this [box folder]([https://uchicago.app.box.com/s/1g90ydgtwkkewrmgsowd98j1ys4mpgk4](https://app.box.com/folder/291920680241))
