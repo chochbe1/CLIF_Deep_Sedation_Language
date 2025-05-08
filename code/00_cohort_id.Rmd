@@ -1,0 +1,1679 @@
+# Project: Patient Preferred Language And Deep Sedation During Invasive Mechanical Ventilation: A Multicenter Retrospective Cohort Study
+# Author: Alex Ortiz
+
+# PART ZERO: Setup Step - Setup libraries
+```{r}
+# Install Packages
+
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack")
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+
+sapply(packages, install_if_missing)
+
+# Load necessary libraries
+library(data.table)
+library(dplyr)
+library(zoo)  # for na.locf function
+library(lubridate)
+library(tidyr)
+library(fst)
+library(arrow)
+library(table1)
+library(metafor)
+library(yaml)
+library(htmltools)
+library(MASS)
+library(pscl)
+library(car)
+
+config <- yaml::read_yaml("config.yaml")
+
+# Define directories based on YAML configuration
+data_dir <- config$data_dir
+output_dir <- config$output_dir
+intermediate_dir <- file.path(output_dir, "intermediate_data/")  # Define output_dir based on data_dir
+file_type <- config$file_type
+institution <- config$institution
+
+# Create the output directory if it does not exist
+if (!dir.exists(intermediate_dir)) {
+  dir.create(intermediate_dir, recursive = TRUE)  # 'recursive = TRUE' allows creating nested directories
+}
+```
+
+# PART ONE: Upload CLIF Respiratory, Hospitalization, ADT, Patient Tables
+```{r}
+read_data <- function(file_path, select = NULL) {
+  if (grepl("\\.csv$|\\.csv\\.gz$", file_path)) {
+    # Use fread with the select argument for CSV and CSV.GZ files
+    return(fread(file_path, select = all_of(select)))
+  } else if (grepl("\\.parquet$", file_path)) {
+    # Use read_parquet with col_select for Parquet files
+    return(arrow::read_parquet(file_path, col_select = all_of(select)))
+  } else if (grepl("\\.fst$", file_path)) {
+    # Use read_fst with columns for FST files
+    return(fst::read_fst(file_path, columns = all_of(select)))
+  } else {
+    stop("Unsupported file format. Only CSV, Parquet, and FST are supported.")
+  }
+}
+
+#Load Raw CLIF Respiratory Support, Hospitalization, Patient, ADT Tables
+respiratory_support <- as.data.table(read_data(paste0(data_dir, "clif_respiratory_support", file_type), select = c("hospitalization_id", "recorded_dttm", "device_category", "mode_category", "tracheostomy", "fio2_set", "peep_set", "lpm_set", "tidal_volume_set")))
+respiratory_support <- unique(respiratory_support, by = c("hospitalization_id", "recorded_dttm"))
+
+hospitalization <-as.data.table(read_data(paste0(data_dir, "clif_hospitalization", file_type),
+  select = c("patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm", 
+                 "age_at_admission", "admission_type_category", "discharge_category")
+))
+hospitalization <- unique(hospitalization, by = "hospitalization_id")
+
+patient_demographics <- as.data.table(read_data(paste0(data_dir,"clif_patient", file_type), select = c("patient_id", "sex_category", "race_category", "ethnicity_category", "death_dttm", "language_name")))
+patient_demographics <- unique(patient_demographics, by = "patient_id")
+
+adt <- as.data.table(read_data(paste0(data_dir, "clif_adt", file_type), select = c("hospitalization_id", "hospital_id", "in_dttm", "out_dttm", "location_category", "location_type")))
+setorder(adt, hospitalization_id, in_dttm)
+
+```
+
+# PART TWO: Identify IMV Runs of at least 24 hours
+```{r}
+# Identify All Hospitalizations with IMV
+resp_supp_imv_id <- respiratory_support[device_category == "IMV"]
+
+imv_hospitalizations <- hospitalization[hospitalization_id %in% resp_supp_imv_id$hospitalization_id]
+
+# Total Respiratory Support Table for IMV Hospitalizations
+respiratory_support_imv <- respiratory_support[hospitalization_id %in% resp_supp_imv_id$hospitalization_id]
+setorder(respiratory_support_imv, hospitalization_id, recorded_dttm)
+
+# Convert blank values in device_category to "NA"
+respiratory_support_imv[device_category == "", device_category := NA]
+
+# Identify IMV Runs According to Rule - Two consecutive IMV values in device_category to start IMV time and two consecutive non-IMV values to end IMV time. If end IMV time is not IDed by algorithm then use recorded_dttm from last row (patient likely discharged - either transferred or deceased)
+imv_runs <- respiratory_support_imv[, {
+  n <- .N
+  run_list <- list()
+  i <- 1
+  
+  while (i <= n) {
+    current <- device_category[i]
+    
+    # Look ahead for second IMV within next few rows (skipping NAs)
+    found_second_imv <- FALSE
+    for (k in (i + 1):n) {
+      if (!is.na(device_category[k]) && device_category[k] == "IMV") {
+        found_second_imv <- TRUE
+        break
+      } else if (!is.na(device_category[k]) && device_category[k] != "IMV") {
+        break  # Stop looking if we hit a non-NA, non-IMV
+      }
+    }
+    
+    if (!is.na(current) && current == "IMV" && found_second_imv) {
+      begin_idx <- i
+      begin_imv <- recorded_dttm[begin_idx]
+      
+      # Search for end: 2 consecutive non-IMV/non-NA rows
+      end_idx <- NA
+      trach_flag <- FALSE
+      for (j in (begin_idx + 1):(n - 1)) {
+        dj1 <- device_category[j]
+        dj2 <- device_category[j + 1]
+        
+        cond1 <- !is.na(dj1) && dj1 != "IMV"
+        cond2 <- !is.na(dj2) && dj2 != "IMV"
+        
+        if (cond1 && cond2) {
+          end_idx <- j
+          if (dj1 == "Trach Collar" || dj2 == "Trach Collar") {
+            trach_flag <- TRUE
+          }
+          break
+        }
+      }
+      
+      # Use last timestamp if no end found
+      if (is.na(end_idx)) {
+        end_imv <- recorded_dttm[n]
+      } else {
+        end_imv <- recorded_dttm[end_idx]
+      }
+      
+      run_list[[length(run_list) + 1]] <- data.table(
+        hospitalization_id = hospitalization_id[1],
+        begin_imv = begin_imv,
+        end_imv = end_imv
+      )
+      
+      if (trach_flag) break
+      
+      i <- if (!is.na(end_idx)) end_idx + 1 else n + 1
+    } else {
+      i <- i + 1
+    }
+  }
+  
+  rbindlist(run_list)
+}, by = hospitalization_id]
+
+# Add duration of IMV and run_id to filter for first period of IMV
+imv_runs[, `:=`(
+  imv_duration_hours = as.numeric(difftime(end_imv, begin_imv, units = "hours")),
+  run_id = seq_len(.N)
+), by = hospitalization_id]
+
+#Reintubations
+reintubations <- imv_runs[run_id >= 2]
+
+# Only Retain the first IMV Run for each hospitalization_id 
+first_imv_runs <- imv_runs[, .SD[1], by = hospitalization_id]
+
+# Filter rows where imv_duration_hours is greater than or equal to 24 hours
+part_two_imv_runs <- first_imv_runs[imv_duration_hours >= 24] 
+part_two_imv_runs <- part_two_imv_runs[, .(hospitalization_id, begin_imv, end_imv, imv_duration_hours)]
+```
+
+# PART THREE: Identify Trach Patients and Remove Them from The Cohort
+```{r}
+# Identify hospitalization_ids that have tracheostomy at some point during their hospitalization and earliest timestamp
+trach_resp <- respiratory_support[tracheostomy == "1"]
+trach_dttm_table <- trach_resp[, .(trach_dttm = min(recorded_dttm)), by = hospitalization_id]
+hosp_id_trach <- unique(trach_resp$hospitalization_id)
+
+# Identify hospital_ids that have "trach collar" device at any point in hospitalization and corresponding earliest timestamp
+trach_collar_resp <- respiratory_support[device_category == "Trach Collar"]
+trach_collar_dttm_table <- trach_collar_resp[, .(trach_collar_dttm = min(recorded_dttm)), by = hospitalization_id]
+hosp_id_trach_collar <- unique(trach_collar_resp$hospitalization_id)
+
+# Merge the Two Trach Hospital DTTM Tables
+trach_times <- merge(trach_dttm_table, trach_collar_dttm_table, by = "hospitalization_id", , all = TRUE)
+trach_times[, first_trach_dttm := pmin(trach_dttm, trach_collar_dttm, na.rm = TRUE)]
+
+# Hospitalization Table for Trach Hospitalization_IDs
+hosp_id_trach_total <- unique(trach_times$hospitalization_id)
+hospitalization_trach <- hospitalization[hospitalization_id %in% hosp_id_trach_total]
+
+# Pull all hospitalizations for each patient_id associated with a trach hospitalization
+all_hospitalizations_trach_patients <- hospitalization[patient_id %in% hospitalization_trach$patient_id]
+
+# Merge Hospitalization and Trach Times and perform LOCF to fill first_trach_dttm
+all_hosp_w_trach_times <- merge(all_hospitalizations_trach_patients, trach_times, by = "hospitalization_id", , all = TRUE)
+setorder(all_hosp_w_trach_times, patient_id, admission_dttm)
+all_hosp_w_trach_times[, first_trach_dttm := na.locf(first_trach_dttm, na.rm = FALSE), by = patient_id]
+
+# Since we have filled out first_trach_dttm for all hospitalizations for patients with any history of trach we can now filter the table only for those with >24-hour IMV runs
+imv_pts_w_trach <- all_hosp_w_trach_times[hospitalization_id %in% part_two_imv_runs$hospitalization_id]
+setorder(imv_pts_w_trach, patient_id, admission_dttm)
+
+# Merge Trach IMV Patients with IMV Run Details
+full_trach_table <- merge(imv_pts_w_trach, part_two_imv_runs, by = "hospitalization_id", , all = TRUE)
+full_trach_table_filt <- full_trach_table[hospitalization_id %in% imv_pts_w_trach$hospitalization_id]
+full_trach_table_filt <- full_trach_table_filt[, .(hospitalization_id, patient_id, admission_dttm, discharge_dttm, discharge_category, begin_imv, end_imv, first_trach_dttm)]
+
+# Create a Flag for Being Trached During Admission
+full_trach_table_filt[, trached_during_admission := 
+  !is.na(first_trach_dttm) & 
+  first_trach_dttm >= (admission_dttm - lubridate::days(1)) & 
+  first_trach_dttm <= (discharge_dttm + lubridate::days(1))
+]
+
+# Create a Flag for Being Trached in the 6 Months Prior to Admission
+full_trach_table_filt[, trached_within_6months_before_admission := 
+  !trached_during_admission & 
+  !is.na(first_trach_dttm) & 
+  (difftime(admission_dttm, first_trach_dttm, units = "days") <= 6 * 30.44) & 
+  (difftime(admission_dttm, first_trach_dttm, units = "days") > 0)
+]
+
+# Create a Flag for Being Trached within 72 hours of IMV
+full_trach_table_filt[, trached_within_72_hours_of_imv := 
+  trached_during_admission & 
+  !is.na(begin_imv) & 
+  first_trach_dttm <= (begin_imv + lubridate::hours(72))
+]
+
+# Create a Flag for Missed Trach Patients - Those Still Intubated within 2 Hours of Discharge who are Discharged to something other than "Expired", "Other", or "Acute Care Hospital"
+full_trach_table_filt[, ventilated_at_discharge := ifelse(difftime(discharge_dttm, end_imv, units = "hours") <= 2, TRUE, FALSE)]
+full_trach_table_filt[, missed_trach := 
+  ifelse(ventilated_at_discharge == "TRUE" & 
+         !(discharge_category %in% c("Expired", "Other", "Acute Care Hospital", "Hospice")), 
+         TRUE, FALSE)]
+
+#Trach Hospitalization_IDs to remove
+trach_hospitalizations_remove <- full_trach_table_filt[
+  trached_within_72_hours_of_imv == TRUE | trached_within_6months_before_admission == TRUE | missed_trach == TRUE, 
+  .(hospitalization_id)
+]
+
+#Remove the trach only hospitalizations from the imv runs
+imv_runs_trach_filt <- part_two_imv_runs[!hospitalization_id %in% trach_hospitalizations_remove$hospitalization_id]
+
+trach_times_filt <- trach_times[hospitalization_id %in% imv_runs_trach_filt$hospitalization_id]
+
+imv_runs_trach_filtered <- merge(imv_runs_trach_filt, trach_times_filt, by = "hospitalization_id", , all = TRUE)
+
+imv_runs_trach_filtered <- imv_runs_trach_filtered[, .(hospitalization_id, begin_imv, end_imv, first_trach_dttm, imv_duration_hours)]
+
+#Reintubation Information on Cleaned Hospitalization_IDs
+reintubations_filtered <- reintubations[hospitalization_id %in% imv_runs_trach_filtered$hospitalization_id]
+reintubations_filtered[, reintubation := ifelse(run_id >= 2, 1, 0)]
+
+reintubations_filtered <- reintubations_filtered[, .(hospitalization_id, reintubation)]
+
+#Put together part_three imv runs combining trach information, reintubation information
+part_three_imv_runs <- merge(imv_runs_trach_filtered, reintubations_filtered, by = "hospitalization_id", , all = TRUE)
+
+part_three_imv_runs[is.na(reintubation), reintubation := 0]
+
+#Need to Calculate imv_duration_hours_trach variable for non re-intubated patients
+part_three_imv_runs[, imv_duration_hours_trach := 
+  ifelse(reintubation == 0, 
+         as.numeric(difftime(first_trach_dttm, begin_imv, units = "hours")), 
+         NA_real_), 
+  by = hospitalization_id]
+
+#Trached Flag
+part_three_imv_runs[, trached := fifelse(!is.na(first_trach_dttm), 1, 0)]
+
+part_three_imv_runs <- unique(part_three_imv_runs, by = c("hospitalization_id"))
+```
+
+# PART FOUR: Remove OSH Transfers Intubated at Admission
+```{r}
+first_device <- merge(respiratory_support, hospitalization, by = "hospitalization_id", all.x = TRUE)
+first_device_filt <- first_device[hospitalization_id %in% part_three_imv_runs$hospitalization_id]
+setorder(first_device_filt, hospitalization_id, recorded_dttm)
+
+earliest_device <- first_device_filt[, .SD[1], by = hospitalization_id, .SDcols = c("recorded_dttm", "device_category")]
+setnames(earliest_device, "device_category", "first_device_category")
+setnames(earliest_device, "recorded_dttm", "first_device_dttm")
+
+first_device_final <- merge(hospitalization, earliest_device, by = "hospitalization_id", all.x = TRUE)
+first_device_final_filt <- first_device_final[hospitalization_id %in% part_three_imv_runs$hospitalization_id]
+
+intubated_transfers <- first_device_final_filt[
+  first_device_category == "IMV" & admission_type_category %in% c("osh", "facility")
+]
+
+intubated_transfers[, time_diff := as.numeric(difftime(first_device_dttm, admission_dttm, units = "hours"))]
+
+part_four_imv_runs <- part_three_imv_runs[!hospitalization_id %in% intubated_transfers$hospitalization_id]
+```
+
+# PART FIVE: ADT Table to Determine Procedural Intubations, Hospital ID, icu_type
+```{r}
+# Merge adt and imv_earliest
+adt_filt <- adt[hospitalization_id %in% part_four_imv_runs$hospitalization_id]
+adt_imv <- merge(part_four_imv_runs, adt_filt, by = "hospitalization_id", all.x = TRUE)
+adt_imv[, recorded_dttm := in_dttm]
+
+#Make sure NA values are actual NAs
+adt_imv[, location_type := fifelse(location_type == "NA", NA_character_, location_type)]
+
+# Ensure Time Formatting is Correct
+adt_imv[, `:=`(
+  begin_imv = as.POSIXct(begin_imv, format = "%Y-%m-%d %H:%M:%S"),
+  recorded_dttm = as.POSIXct(recorded_dttm, format = "%Y-%m-%d %H:%M:%S"),
+  out_dttm = as.POSIXct(out_dttm, format = "%Y-%m-%d %H:%M:%S")
+)]
+setorder(adt_imv, hospitalization_id, in_dttm)
+
+#Determine Hospital_ID for each hospitalization_id
+adt_hospital_id <- adt_imv[!is.na(hospital_id), .SD[1], by = hospitalization_id]
+
+#Determine First Location in Hospital
+adt_first_loc <- adt_imv[
+  !is.na(location_category) & !(location_category %in% c("other", "radiology", "rehab", "dialysis")), 
+  .SD[1], 
+  by = hospitalization_id
+]
+
+#Determine First ICU Type 
+adt_first_icu <- adt_imv[
+  location_category == "icu", 
+  .SD[1], 
+  by = hospitalization_id
+]
+
+# Get the location prior to ICU (or "direct_admission" if ICU is first)
+adt_pre_icu <- adt_imv[
+  , {
+    icu_index <- which(location_category == "icu")[1]  # index of first ICU
+    if (is.na(icu_index)) {
+      .(location_before_icu = NA_character_)  # no ICU at all
+    } else if (icu_index == 1) {
+      .(location_before_icu = "direct_admission")  # ICU is first location
+    } else {
+      # get location before ICU; skip if it's NA
+      loc <- location_category[icu_index - 1]
+      if (is.na(loc)) {
+        .(location_before_icu = "direct_admission")
+      } else {
+        .(location_before_icu = loc)
+      }
+    }
+  },
+  by = hospitalization_id
+]
+
+#Filter Only for those with ADT data and those who were in an ICU
+adt_imv_filt <- adt_imv[hospitalization_id %in% adt_first_icu$hospitalization_id]
+
+# Create Location of Intubation Flag
+adt_imv_filt[, location_of_intubation_flag := 
+  begin_imv >= in_dttm & begin_imv <= out_dttm]
+
+adt_imv_filt[, location_of_intubation_flag := 
+  seq_len(.N) == which.max(location_of_intubation_flag), by = hospitalization_id]
+
+# Set location_of_intubation: use location_type if not NA, otherwise use location_category
+adt_imv_filt[, location_of_intubation := fifelse(location_of_intubation_flag,
+                                            ifelse(!is.na(location_type), location_type, location_category),
+                                            NA_character_)]
+
+# Create flag to identify procedural intubations 
+adt_imv_filt[, procedural_intubation := FALSE]
+#Intubated in the OR Rule
+adt_imv_filt[, procedural_intubation := 
+  location_category == "procedural" & location_of_intubation_flag == TRUE, 
+  by = hospitalization_id]
+# First Device After Coming Back from OR = IMV Rule
+adt_imv_filt <- adt_imv_filt %>%
+  group_by(hospitalization_id) %>%
+  mutate(procedural_intubation = procedural_intubation |
+           (lead(location_of_intubation_flag) == TRUE & location_category == "procedural")) %>%
+  ungroup()
+setDT(adt_imv_filt)
+
+# Calculate total procedural hours for each hospitalization with procedural intubation
+procedural_hours <- adt_imv_filt[
+  (procedural_intubation == TRUE & location_category == "procedural") |
+  (procedural_intubation == TRUE & shift(location_category == "procedural", type = "lag") & location_of_intubation_flag == TRUE),
+  .(procedural_hours = as.numeric(difftime(out_dttm, in_dttm, units = "hours"))),
+  by = hospitalization_id
+]
+
+#Merge back to Main Table
+adt_imv_filt <- merge(adt_imv_filt, procedural_hours, by = "hospitalization_id", all.x = TRUE)
+
+# Replace NAs with 0 for patients without procedural intubations
+adt_imv_filt[is.na(procedural_hours), procedural_hours := 0]
+
+procedural_rows <- adt_imv_filt[
+  procedural_intubation == TRUE & procedural_hours >= 8
+]
+
+# Filter out all the procedural intubations
+imv_runs_clean_procedure <- part_four_imv_runs[!hospitalization_id %in% procedural_rows$hospitalization_id]
+
+adt_imv_non_procedural <- adt_imv_filt[hospitalization_id %in% imv_runs_clean_procedure$hospitalization_id]
+
+#Identify Location of Intubation for the Remaining Hospitalizations
+location_of_intubation <- adt_imv_non_procedural %>%
+  filter(!is.na(location_of_intubation) & location_of_intubation != "") %>%
+  dplyr::select(hospitalization_id, location_of_intubation, intubation_time = begin_imv)
+
+icu_location_of_imv <- adt_imv_non_procedural[
+  , {
+    intubation_index <- which(location_of_intubation_flag == TRUE)[1]
+    if (!is.na(intubation_index)) {
+      if (location_category[intubation_index] == "icu") {
+        .SD[intubation_index]  # Use the intubation row itself
+      } else {
+        icu_index <- which(location_category == "icu" & .I > intubation_index)[1]
+        if (!is.na(icu_index)) .SD[icu_index] else NULL
+      }
+    } else {
+      NULL
+    }
+  },
+  by = hospitalization_id
+]
+icu_location_of_imv <- icu_location_of_imv[, .(hospitalization_id, location_type)]
+setnames(icu_location_of_imv, "location_type", "imv_icu")
+
+#IMV Admission Source
+imv_admission_source <- adt_imv_non_procedural[
+  , {
+    intubation_index <- which(location_of_intubation_flag == TRUE)[1]
+    
+    if (!is.na(intubation_index)) {
+      loc_cat <- location_category[intubation_index]
+      
+      if (!is.na(loc_cat) && loc_cat == "icu") {
+        # Look backward for the first non-NA, non-icu location
+        prior_locs <- location_category[1:(intubation_index - 1)]
+        valid_prior_locs <- prior_locs[!is.na(prior_locs) & prior_locs != "icu"]
+        
+        if (length(valid_prior_locs) > 0) {
+          source <- tail(valid_prior_locs, 1)  # last valid location before ICU
+        } else {
+          source <- "direct_admission"
+        }
+        
+      } else if (!is.na(loc_cat)) {
+        source <- loc_cat
+      } else {
+        source <- NA_character_
+      }
+      
+      list(imv_admission_source = source)
+    } else {
+      list(imv_admission_source = NA_character_)
+    }
+  },
+  by = hospitalization_id
+]
+
+first_location <- adt_first_loc[hospitalization_id %in% location_of_intubation$hospitalization_id]
+first_location <- first_location[, .(hospitalization_id, location_category)]
+
+first_icu <- adt_first_icu[hospitalization_id %in% location_of_intubation$hospitalization_id]
+first_icu <- first_icu[, .(hospitalization_id, location_type)]
+
+first_hosp_id <- adt_hospital_id[hospitalization_id %in% location_of_intubation$hospitalization_id]
+first_hosp_id <- first_hosp_id[, .(hospitalization_id, hospital_id)]
+
+icu_admission_source <- adt_pre_icu[hospitalization_id %in% location_of_intubation$hospitalization_id]
+
+# List of tables to merge
+tables_merge_part_five <- list(icu_location_of_imv,
+               location_of_intubation,
+               first_location,
+               first_icu, 
+               first_hosp_id,
+               icu_admission_source,
+               imv_admission_source)
+
+# Iterative Merge on Hospitalization_id to form icu_admission_source_final
+icu_admission_source_merge <- reduce(tables_merge_part_five, function(x, y) merge(x, y, by = "hospitalization_id", all = TRUE))
+setnames(icu_admission_source_merge, "location_type", "first_icu")
+setnames(icu_admission_source_merge, "location_category", "hospital_admission_source")
+setnames(icu_admission_source_merge, "imv_icu", "icu_type")
+setnames(icu_admission_source_merge, "imv_admission_source", "icu_admission_source")
+
+set(icu_admission_source_merge, j = "hospital_icu_id", 
+    value = paste(icu_admission_source_merge$hospital_id, 
+                  icu_admission_source_merge$icu_type, sep = "_"))
+
+icu_admission_source_final <- icu_admission_source_merge[, .(hospitalization_id, hospital_id, icu_type, hospital_icu_id, icu_admission_source, hospital_admission_source)]
+
+#Clean out any hospitalizations with missing data
+icu_admission_source_final <- icu_admission_source_final[!is.na(icu_type)]
+icu_admission_source_final <- icu_admission_source_final[!is.na(icu_admission_source)]
+icu_admission_source_final <- icu_admission_source_final[!is.na("hospital_id")]
+
+# Create part five IMV Runs
+xx_part_four_filt <- part_four_imv_runs[hospitalization_id %in% icu_admission_source_final$hospitalization_id]
+
+part_five_imv_runs <- merge(xx_part_four_filt, icu_admission_source_final, by = "hospitalization_id", all = TRUE)
+part_five_imv_runs <- unique(part_five_imv_runs, by = c("hospitalization_id"))
+
+```
+
+# PART SIX: Upload Patient Assessments, Vitals
+```{r}
+#Vitals
+specific_vital_categories <- c("height_cm", "weight_kg", "sbp", "dbp", "map", "spo2")
+vitals_all <- as.data.table(read_data(paste0(data_dir, "clif_vitals", file_type), 
+  select = c("hospitalization_id", "recorded_dttm", "vital_category", "vital_value")))[vital_category %in% specific_vital_categories]
+
+#Patient Assessments
+specific_assessment_categories <- c("RASS", "gcs_total", "sbt_screen_pass_fail")
+patient_assessments <- as.data.table(read_data(paste0(data_dir, "clif_patient_assessments", file_type), select = c("hospitalization_id", "recorded_dttm", "assessment_category", "numerical_value", "categorical_value")))[  hospitalization_id %in% part_five_imv_runs$hospitalization_id & assessment_category %in% specific_assessment_categories]
+patient_assessments[, `:=`(hospitalization_id = as.character(hospitalization_id))]
+patient_assessments <- unique(patient_assessments, by = c("hospitalization_id", "recorded_dttm", "assessment_category"))
+
+```
+
+# PART SEVEN: Height, Weight, and BMI Data
+```{r}
+# Create Hospitalization Table for Filtered Hospitalizations 
+hospitalization_table_part_seven <- hospitalization[hospitalization_id %in% part_five_imv_runs$hospitalization_id]
+
+# Create Table of All Hospitalizations for Patients Filtered Above
+hosp_height_weight_all <- hospitalization[patient_id %in% hospitalization_table_part_seven$patient_id]
+hosp_height_weight_all <- hosp_height_weight_all[, .(hospitalization_id, patient_id, admission_dttm, discharge_dttm)]
+setorder(hosp_height_weight_all, patient_id, admission_dttm)
+#hosp_id_height_weight <- unique(hosp_height_weight_all$hospitalization_id)
+
+# Create Vitals Table 
+height_weight <- c("height_cm", "weight_kg")
+vitals_bmi <- vitals_all[hospitalization_id %in% hosp_height_weight_all$hospitalization_id & vital_category %in% height_weight]
+
+# Merge Cohort Info from IMV Hospitalizations with Vitals from All patient_id Hospitalizations
+imv_bmi_merge <- merge(hosp_height_weight_all, part_five_imv_runs, 
+  by = c("hospitalization_id"), 
+  all = TRUE)
+setorder(imv_bmi_merge, patient_id, admission_dttm)
+
+# Flag rows with begin_imv and end_imv (i.e the ones corresponding to a cohort admission)
+valid_imv_rows <- imv_bmi_merge[!is.na(begin_imv) & !is.na(end_imv)]
+
+# Create a unique key for each hospitalization with valid IMV times
+valid_imv_rows[, key_id := .I]
+
+# Join on patient_id and filter only for hospitalizations within +/- one year of IMV hospitalization
+result_height_weight <- imv_bmi_merge[valid_imv_rows, on = .(patient_id), nomatch = 0][
+  admission_dttm >= (i.admission_dttm - 365*24*60*60) & 
+  admission_dttm <= (i.admission_dttm + 365*24*60*60)]
+
+# Filter BMI vitals table to only contain data hospitalizations IDed in previous step
+vitals_bmi_filt <- vitals_bmi[hospitalization_id %in% result_height_weight$hospitalization_id]
+
+# Reshape the data to put height/weight into separate columns, using mean to handle duplicates
+vitals_bmi_filt <- dcast(vitals_bmi_filt, 
+                   hospitalization_id + recorded_dttm ~ vital_category, 
+                   value.var = "vital_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+vitals_bmi_filt <- vitals_bmi_filt[, .(hospitalization_id, recorded_dttm, weight_kg, height_cm)]
+setorder(vitals_bmi_filt, hospitalization_id, recorded_dttm)
+
+# Obtain Patient_IDs associated with BMI Hospitalizations and merge with reshaped table
+pat_hosp_list <- imv_bmi_merge[, .(patient_id, hospitalization_id)]
+vitals_bmi_patient <- merge(vitals_bmi_filt, pat_hosp_list, by = "hospitalization_id", all = TRUE)
+setorder(vitals_bmi_patient, patient_id, recorded_dttm)
+
+# Table of All Height Values - filter out very low values
+height_patient <- vitals_bmi_patient[!is.na(height_cm)]
+height_patient <- height_patient[, .(patient_id, recorded_dttm, height_cm)]
+height_patient <- height_patient[height_cm >= 100]
+
+# Find Median Height for each Patient within +/- 1 year of IMV hospitalization
+median_height_per_patient <- height_patient[, .(
+  median_height = median(height_cm, na.rm = TRUE)
+), by = patient_id]
+
+height_hosp <- merge(median_height_per_patient, hosp_height_weight_all, by = "patient_id", all.x = TRUE)
+height_hosp <- height_hosp[, .(hospitalization_id, median_height)]
+
+# Create Weight Table and filter out improbably low weights
+weight_patient <- vitals_bmi_patient[!is.na(weight_kg)]
+weight_patient <- weight_patient[, .(patient_id, hospitalization_id, recorded_dttm, weight_kg)]
+weight_patient <- weight_patient[weight_kg >= 35]
+
+# Create table to obtain admission_dttm for all hospitalizations for IMV patients
+admission_dttm_table <- hosp_height_weight_all[
+  patient_id %in% weight_patient$patient_id, 
+  .(hospitalization_id, patient_id, admission_dttm)]
+
+# Add admission_dttm to the weight_patient table
+admission_weight_table <- merge(
+  admission_dttm_table, weight_patient,
+  by = c("hospitalization_id", "patient_id"), 
+  all = TRUE)
+setorder(admission_weight_table, hospitalization_id, recorded_dttm)
+
+# Calculate absolute time difference between admission_dttm and recorded_dttm
+admission_weight_table[, time_diff := abs(difftime(admission_dttm, recorded_dttm, units = "secs"))]
+
+# For each patient_id and admission_dttm, find the row with the minimum time_diff
+admission_weight_table[, .SD[which.min(time_diff)], by = .(patient_id, admission_dttm), .SDcols = c("admission_dttm", "weight_kg")]
+
+# Create the final table with patient_id, admission_dttm, and admission_weight
+final_weight_table <- admission_weight_table[, .SD[which.min(time_diff)], by = .(patient_id, admission_dttm), .SDcols = c("admission_dttm", "weight_kg")]
+final_weight_table[, admission_weight := weight_kg]
+final_weight_table <- final_weight_table[, .(patient_id, admission_dttm, admission_weight)]
+
+# Weight Table
+weight_hosp <- merge(final_weight_table, hosp_height_weight_all, c("patient_id", "admission_dttm"), all = TRUE)
+weight_hosp <- weight_hosp[, .(hospitalization_id, admission_weight)]
+
+# Create BMI Table, heigh_m column, and calculate BMI
+patient_bmi_data <- merge(weight_hosp, height_hosp, by = c("hospitalization_id"), 
+  all = TRUE)
+patient_bmi_data[, height_m := median_height / 100]
+patient_bmi_data[, bmi := admission_weight / (height_m^2)]
+
+# Cleaned BMI Table
+patient_bmi_data_clean <- patient_bmi_data[, .(hospitalization_id, admission_weight, median_height, bmi)]
+setnames(patient_bmi_data_clean, "median_height", "admission_height")
+
+# BMI/Height/Weight Data for Hospitalizations Through Part Six
+patient_bmi_data_final <- patient_bmi_data_clean[hospitalization_id %in% part_five_imv_runs$hospitalization_id]
+
+# Filter out patients with no BMI data - removes ~111
+patient_bmi_data_final <- patient_bmi_data_final[!is.na(bmi)]
+
+# Update IMV Runs
+xx_part_five_filt <- part_five_imv_runs[hospitalization_id %in% patient_bmi_data_final$hospitalization_id]
+
+part_seven_imv_runs <- merge(xx_part_five_filt, patient_bmi_data_final, by = "hospitalization_id", all = TRUE)
+part_seven_imv_runs <- unique(part_seven_imv_runs, by = c("hospitalization_id"))
+```
+
+# PART EIGHT: Remove patients with RASS values >8 hours from Beginning IMV and those with less than 2 RASS measurements per 24-hour period
+```{r}
+# RASS Assessment Table
+pat_assess_rass <- patient_assessments[assessment_category == "RASS"]
+setorder(pat_assess_rass, hospitalization_id, recorded_dttm)
+
+pat_assess_rass_filt <- pat_assess_rass[hospitalization_id %in% part_seven_imv_runs$hospitalization_id]
+
+# Convert Numerical and Categorical RASS Values to Standard Number
+pat_assess_rass_filt[, rass_value := fifelse(
+  !is.na(numerical_value), # If numerical_value is present, prioritize it
+  as.character(as.integer(numerical_value)), # Convert numerical_value to integer and then to character
+  fifelse(
+    grepl("^\\+?(-?5|-?4|-?3|-?2|-?1|0|1|2|3|4)$", categorical_value), # Check if categorical_value matches permissible values (with optional + or -)
+    as.character(as.integer(sub("^\\+", "", categorical_value))), # Remove leading "+" if present, then convert to integer and then to character
+    NA_character_ ))]
+
+# Merge imv_runs from part 7 with RASS filtered
+hosp_time_rass <- merge(part_seven_imv_runs, pat_assess_rass_filt, by = "hospitalization_id", all = TRUE)
+
+# Calculate Time Difference Between RASS Documentation and Begin IMV
+hosp_time_rass[, time_to_first_rass := as.numeric(difftime(recorded_dttm, begin_imv, units = "hours"))]
+
+# Determine RASS value closest to Beginning IMV
+hosp_time_rass_closest <- hosp_time_rass[time_to_first_rass >= -1, 
+                                         .SD[which.min(time_to_first_rass)], 
+                                         by = hospitalization_id]
+
+# Clean Out Those with RASS Values Not Documented within 8 hours of IMV
+# Removes ~900 Admissions
+time_to_first_rass_final <- hosp_time_rass_closest[time_to_first_rass >= -1 & time_to_first_rass <= 8]
+time_to_first_rass_final[time_to_first_rass < 0, time_to_first_rass := 0]
+setnames(time_to_first_rass_final, "recorded_dttm", "first_rass_dttm")
+time_to_first_rass_final <- time_to_first_rass_final[, .(hospitalization_id, time_to_first_rass)]
+
+
+# Timestamps
+rass_cohort_timestamps <- part_seven_imv_runs[hospitalization_id %in% time_to_first_rass_final$hospitalization_id][, .(hospitalization_id, begin_imv, end_imv, imv_duration_hours)]
+
+# Calculate start_time (begin_imv)
+rass_cohort_timestamps[, start_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+rass_cohort_timestamps[, end_time := as.POSIXct(begin_imv) + hours(48), by = hospitalization_id]
+
+pat_assess_rass_cohort_clean <- pat_assess_rass_filt[hospitalization_id %in% time_to_first_rass_final$hospitalization_id]
+setorder(pat_assess_rass_cohort_clean, hospitalization_id, recorded_dttm)
+
+#Clean Only for rass_value
+total_timeline_rass <- merge(pat_assess_rass_cohort_clean, rass_cohort_timestamps, by = "hospitalization_id", all = TRUE)[, .(hospitalization_id, recorded_dttm, rass_value, start_time, end_time)]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+total_timeline_rass_filt <- total_timeline_rass[recorded_dttm >= start_time & recorded_dttm <= end_time]
+
+total_timeline_rass_filt <- total_timeline_rass_filt[!is.na(rass_value)]
+total_timeline_rass_filt[, rass_value := as.numeric(rass_value)]
+
+# Ensure data is sorted chronologically within each hospitalization
+setorder(total_timeline_rass_filt, hospitalization_id, recorded_dttm)
+
+# Compute the time duration for which each RASS value persists
+total_timeline_rass_filt[, lead_time := shift(recorded_dttm, type = "lead"), by = hospitalization_id]
+
+# If it's the last recorded RASS value, set duration to the difference between end_time and recorded_dttm
+total_timeline_rass_filt[, rass_duration := as.numeric(difftime(lead_time, recorded_dttm, units = "hours"))]
+total_timeline_rass_filt[is.na(rass_duration), rass_duration := as.numeric(difftime(end_time, recorded_dttm, units = "hours"))]
+
+# Calculate the time-weighted sum of RASS values per hospitalization
+rass_weighted_sum <- total_timeline_rass_filt[, .(rass_weighted = sum(rass_value * rass_duration, na.rm = TRUE)), by = hospitalization_id]
+
+# Calculate total time spent under observation
+rass_total_time <- total_timeline_rass_filt[, .(total_observed_time = sum(rass_duration, na.rm = TRUE)), by = hospitalization_id]
+
+# Merge to get the final time-weighted RASS average
+rass_calc <- merge(rass_weighted_sum, rass_total_time, by = "hospitalization_id", all = TRUE)
+rass_calc[, rass_weighted_avg := rass_weighted / total_observed_time]
+
+# Define deep sedation based on the time-weighted RASS average
+rass_calc[, deep_sedation_weighted := rass_weighted_avg < -3]
+
+# Merge with timestamps to get full dataset
+rass_calc_timeline <- merge(rass_calc, rass_cohort_timestamps, by = "hospitalization_id", all = TRUE)
+
+# Set observation time (capped at 48 hours)
+rass_calc_timeline[, observation_time := ifelse(imv_duration_hours < 48, imv_duration_hours, 48)]
+
+rass_measurements <- total_timeline_rass_filt[, .(rass_count = .N), by = hospitalization_id]
+rass_cumulative <- total_timeline_rass_filt[, .(rass_cumulative = sum(rass_value, na.rm = TRUE)), 
+                                            by = hospitalization_id]
+
+rass_calc_timeline_merge <- merge(rass_calc_timeline, rass_measurements, by = "hospitalization_id", all = TRUE)
+rass_calc_timeline_merge_two <- merge(rass_calc_timeline_merge, rass_cumulative, by = "hospitalization_id", all = TRUE)
+
+# Compute RASS frequency (number of RASS values per observation period)
+rass_calc_timeline_merge_two[, rass_frequency_hrs := observation_time / rass_count]
+ 
+rass_calc_timeline_merge_two[, rass_unweighted_avg := rass_cumulative / rass_count]
+
+# Define deep sedation based on the time-weighted RASS average
+rass_calc_timeline_merge_two[, deep_sedation_unweighted := rass_unweighted_avg < -3]
+
+# Total Number of RASS Values -3 or lower
+rass_counts <- total_timeline_rass_filt[rass_value <= -3, .N, by = hospitalization_id]
+setnames(rass_counts, "N", "rass_below_minus_3_count")
+
+rass_calc_timeline_merge_three <- merge(rass_calc_timeline_merge_two, rass_counts, by = "hospitalization_id", all = TRUE)
+
+# Apply filtering
+rass_calc_timeline_filt <- rass_calc_timeline_merge_three[rass_frequency_hrs <= 12][, .(hospitalization_id, rass_weighted_avg, rass_unweighted_avg, rass_frequency_hrs, rass_count, deep_sedation_weighted, deep_sedation_unweighted, rass_below_minus_3_count)]
+
+# Updated IMV
+xx_part_seven_filt <- part_seven_imv_runs[hospitalization_id %in% rass_calc_timeline_filt$hospitalization_id]
+
+part_eight_imv_runs <- merge(xx_part_seven_filt, rass_calc_timeline_filt, by = "hospitalization_id", all = TRUE)
+
+part_eight_imv_runs[, imv_duration_hours_final := 
+  fifelse(
+    is.na(imv_duration_hours) & is.na(imv_duration_hours_trach), 
+    NA_real_,
+    pmin(imv_duration_hours, imv_duration_hours_trach, na.rm = TRUE)
+  )
+]
+part_eight_imv_runs <- unique(part_eight_imv_runs, by = c("hospitalization_id"))
+```
+
+
+#PART NINE: Patient Demographics and Assemblance of Time-Independent Covariate Table
+```{r}
+# Updated Hospitalization Table
+hospitalization_part_nine <- hospitalization[hospitalization_id %in% part_eight_imv_runs$hospitalization_id]
+
+# Filtered Patient Demographics
+patient_demographics_part_nine <- patient_demographics[patient_id %in% hospitalization_part_nine$patient_id]
+
+# Merge Patient and Age at Admission
+demographics <- merge(hospitalization_part_nine, patient_demographics_part_nine, by = "patient_id", all = TRUE)
+demographics <- demographics[, .(hospitalization_id, patient_id, race_category, ethnicity_category, sex_category, language_name, death_dttm, age_at_admission)]
+setDT(demographics)
+
+# Clean language_name and remove Unknown and Non-Verbal Patients
+demographics[, language_cat := fifelse(
+  is.na(language_name) | language_name %in% c("Other", "Unknown", "Patient Declined", "", "NA", "na", "n/a", "N/A"), "Unknown",
+  fifelse(language_name == "English", "English",
+  fifelse(language_name == "Spanish", "Spanish",
+  fifelse(language_name %in% c("ASL", "Sign Language", "Non-Verbal", "American Sign Language", "American Sign Language (ASL)"), "Non-Verbal Language",
+         "Other Language"))))]
+demographics <- demographics[demographics$language_cat != "Unknown", ]
+demographics <- demographics[demographics$language_cat != "Non-Verbal Language", ]
+
+# Filter out patients under 18 and over 110 and those with unknown or missing language data
+patient_demographics_final_cohort <- demographics[
+  age_at_admission >= 18 & age_at_admission < 120
+]
+patient_demographics_final_cohort[, race_category := as.character(race_category)]
+patient_demographics_final_cohort[, race_category := fifelse(
+  race_category %in% c("American Indian or Alaska Native", "Native Hawaiian or Other Pacific Islander", "Unknown", "Other"),
+  "Other/Unknown",
+  race_category
+)]
+patient_demographics_final_cohort[, ethnicity_category := fifelse(
+  ethnicity_category %in% c("Non-Hispanic", "Unknown"),
+  "Non-Hispanic/Unknown",
+  ethnicity_category
+)]
+patient_demographics_final_cohort[, c("age_at_admission") := NULL]
+
+#Final Cohort Table
+xx_part_eight_filt <- part_eight_imv_runs[hospitalization_id %in% patient_demographics_final_cohort$hospitalization_id]
+
+intermediate_imv_runs <- merge(
+  xx_part_eight_filt, 
+  patient_demographics_final_cohort[, .(hospitalization_id, patient_id, race_category, ethnicity_category, sex_category, language_name, language_cat, death_dttm)], 
+  by = "hospitalization_id", 
+  all = TRUE
+)
+
+hospitalization_final_cohort <- hospitalization_part_nine[hospitalization_id %in% intermediate_imv_runs$hospitalization_id]
+
+part_nine_imv_runs <- merge(intermediate_imv_runs, hospitalization_final_cohort, by = c("hospitalization_id", "patient_id"), all = TRUE)
+
+part_nine_imv_runs[, death_dttm := as.POSIXct(death_dttm, tz = "UTC")]
+
+# Correct any death_dttm errors
+part_nine_imv_runs[death_dttm < discharge_dttm & discharge_category == "Expired", death_dttm := discharge_dttm]
+part_nine_imv_runs[
+  is.na(death_dttm) & discharge_category == "Expired", 
+  death_dttm := discharge_dttm
+]
+
+part_nine_imv_runs[, begin_imv := as.POSIXct(begin_imv, tz = "UTC")]
+
+# Died During Admission Flag
+part_nine_imv_runs[, death_during_admission := 
+    !is.na(death_dttm) & (death_dttm >= admission_dttm & death_dttm <= discharge_dttm)]
+
+# Total IMV Time in Days
+part_nine_imv_runs[, imv_duration_days := imv_duration_hours_final / 24]
+
+# Died Within 28-Days
+part_nine_imv_runs[, death_within_28_days_of_imv := 
+    !is.na(death_dttm) & !is.na(begin_imv) & 
+    (death_dttm >= begin_imv - days(1) & death_dttm <= begin_imv + days(28))]
+
+# Days from Begin IMV to Death
+part_nine_imv_runs[, days_from_begin_imv_to_death := 
+    ifelse(death_within_28_days_of_imv == TRUE & abs(as.numeric(difftime(death_dttm, begin_imv, units = "days")) - imv_duration_days) <= 1, 
+           imv_duration_days, 
+           ifelse(death_within_28_days_of_imv == TRUE, 
+                  as.numeric(difftime(death_dttm, begin_imv, units = "days")), 
+                  NA))]
+
+# 30 Day Mortality
+part_nine_imv_runs[, thirty_day_mortality := 
+    !is.na(death_dttm) & !is.na(begin_imv) & 
+    (death_dttm >= begin_imv - days(1) & death_dttm <= begin_imv + days(30))]
+
+#Age Category
+part_nine_imv_runs <- part_nine_imv_runs %>%
+  mutate(age_category = case_when(
+    age_at_admission >= 18 & age_at_admission < 35 ~ "18-34 Years",
+    age_at_admission >= 35 & age_at_admission < 45 ~ "35-44 Years",
+    age_at_admission >= 45 & age_at_admission < 55 ~ "45-54 Years",
+    age_at_admission >= 55 & age_at_admission < 65 ~ "55-64 Years",
+    age_at_admission >= 65 & age_at_admission < 75 ~ "65-74 Years",
+    age_at_admission >= 75  ~ "75+ Years",
+    TRUE ~ NA_character_ # Assign NA for any cases that don't fit
+  ))
+setDT(part_nine_imv_runs)
+
+#############################################
+#Hospital Free Days over 6 months
+
+#Table of hospitalization_id & admission_dttm for all encounters
+cohort_admissions <- part_nine_imv_runs[, .(hospitalization_id, patient_id, admission_dttm, discharge_dttm)]
+setnames(cohort_admissions, "admission_dttm", "cohort_admission_dttm")
+setnames(cohort_admissions, "discharge_dttm", "cohort_discharge_dttm")
+setnames(cohort_admissions, "hospitalization_id", "cohort_hospitalization_id")
+cohort_admissions[, cohort_admission_dttm := as.POSIXct(cohort_admission_dttm, tz = "UTC")]
+
+#Create 6_month_marker
+cohort_admissions[, `6_month` := add_with_rollback(cohort_admission_dttm, months(6))]
+
+#All hospitalizations for the cohort
+hosp_hfd <- hospitalization[patient_id %in% patient_demographics_final_cohort$patient_id]
+
+#Merge with cohort_admissions
+hfd_calc <- merge(hosp_hfd, cohort_admissions, by = "patient_id", all.x = TRUE)
+
+#Filter hosp_hfd only for those between cohort_admission_dttm and 6 months of cohort_admission_dttm
+hfd_calc_filtered <- hfd_calc %>%
+  filter(admission_dttm >= cohort_admission_dttm & admission_dttm <= `6_month`)
+
+#Calculate Total Hospitalization Days for each patient_id taking into account 6-month cutoff
+hfd_calc_filtered <- hfd_calc_filtered %>%
+  mutate(total_days = ifelse(
+    discharge_dttm <= `6_month`, 
+    as.numeric(difftime(discharge_dttm, admission_dttm, units = "days")),
+    as.numeric(difftime(`6_month`, admission_dttm, units = "days"))
+  ))
+setDT(hfd_calc_filtered)
+
+set(hfd_calc_filtered, j = "patient_cohort_id", 
+    value = paste(hfd_calc_filtered$patient_id, 
+                  hfd_calc_filtered$cohort_hospitalization_id, sep = "_"))
+
+hfd_calc_final <- hfd_calc_filtered %>%
+  group_by(patient_cohort_id) %>%
+  mutate(hospitalization_days_6_month_total = sum(total_days, na.rm = TRUE)) %>%
+  ungroup()
+setDT(hfd_calc_final)
+setorder(hfd_calc_final, patient_cohort_id, admission_dttm)
+
+hfd_calc_final_filtered <- hfd_calc_final[
+  hospitalization_id == cohort_hospitalization_id
+]
+
+hfd_calc_final_filtered <- hfd_calc_final_filtered[, .(hospitalization_id, hospitalization_days_6_month_total)]
+
+part_nine_imv_runs_intermediate <- merge(part_nine_imv_runs, hfd_calc_final_filtered, by = "hospitalization_id", all = TRUE)
+
+# Died Within 6-Months
+part_nine_imv_runs_intermediate[, death_within_6_months_of_admission := 
+    !is.na(death_dttm) & !is.na(admission_dttm) & 
+    (death_dttm >= admission_dttm - days(1) & death_dttm <= admission_dttm + days(183))]
+
+# Days from Admission to Death
+part_nine_imv_runs_intermediate[, days_from_admission_to_death := 
+           ifelse(death_within_6_months_of_admission == TRUE, 
+                  as.numeric(difftime(death_dttm, admission_dttm, units = "days")), 
+                  NA)]
+
+# Six Month Hospital Free Days
+part_nine_imv_runs_intermediate[, hfd_6m := 
+    ifelse(hospitalization_days_6_month_total > 183, 
+           0,  # Case 0: More than 183 hospitalization days
+           ifelse(death_during_admission == TRUE, 
+                  0,  # Case 1: Death during admission
+                  ifelse(death_within_6_months_of_admission == FALSE, 
+                         pmax(183 - hospitalization_days_6_month_total, 0),  # Case 2: Survived 6 months, ensure non-negative
+                         ifelse(death_within_6_months_of_admission == TRUE & death_during_admission == FALSE, 
+                                pmax(days_from_admission_to_death - hospitalization_days_6_month_total, 0),  # Case 3: Died within 6 months but not during admission, ensure non-negative
+                                NA  # Catch-all for unexpected cases
+                         )
+                  )
+           )
+    )
+]
+
+###################################
+# 28 Day Ventilator Free Days
+#First Deal with Reintubations
+reintubations_vfd <- reintubations[hospitalization_id %in% part_nine_imv_runs$hospitalization_id]
+reintubations_vfd <- reintubations_vfd[, .(hospitalization_id, begin_imv, end_imv, run_id)]
+
+begin_first_imv <- part_nine_imv_runs[hospitalization_id %in% reintubations_vfd$hospitalization_id]
+  
+begin_first_imv <- begin_first_imv[, .(hospitalization_id, begin_imv)]
+setnames(begin_first_imv, "begin_imv", "begin_first_imv")
+
+vfd_reintubated_patients <- merge(reintubations_vfd, begin_first_imv, by = "hospitalization_id", all.x = TRUE)
+vfd_reintubated_patients[, `28_day` := begin_first_imv + days(28)]
+vfd_reintubated_patients[, `28_day_flag` := begin_imv < `28_day`]
+
+vfd_reintubated_patients[, days_reintubated := 
+  ifelse(`28_day_flag` == TRUE, 
+         as.numeric(pmin(end_imv, `28_day`) - begin_imv, units = "days"),
+         NA_real_)
+]
+
+days_reintubated <- vfd_reintubated_patients[
+  , .(days_reintubated_28 = sum(days_reintubated, na.rm = TRUE)), 
+  by = hospitalization_id
+]
+
+part_nine_imv_runs_final <- merge(part_nine_imv_runs_intermediate, days_reintubated, by = "hospitalization_id", all = TRUE)
+setnafill(part_nine_imv_runs_final, cols = "days_reintubated_28", fill = 0)
+
+part_nine_imv_runs_final[, vfd_raw := 
+    ifelse(death_within_28_days_of_imv == FALSE & imv_duration_days < 28, 
+           28 - imv_duration_days, 
+           ifelse(death_within_28_days_of_imv == FALSE & imv_duration_days > 28, 
+                  0, 
+                  ifelse(death_within_28_days_of_imv == TRUE, 
+                         days_from_begin_imv_to_death - imv_duration_days, 
+                         NA)))]
+
+part_nine_imv_runs_final[, vfd_clean := vfd_raw - days_reintubated_28]
+```
+
+# PART TEN: Time to SBT
+```{r}
+sbt_screen <- patient_assessments[assessment_category == "sbt_screen_pass_fail"]
+setorder(sbt_screen, hospitalization_id, recorded_dttm)
+
+sbt_screen_filt <- sbt_screen[hospitalization_id %in% part_nine_imv_runs$hospitalization_id]
+
+sbt_screen_imv_times <- merge(sbt_screen_filt, part_nine_imv_runs, by = "hospitalization_id", all = TRUE)
+
+sbt_screen_imv_times_filt <- sbt_screen_imv_times[recorded_dttm >= begin_imv]
+
+sbt_screen_pass <- sbt_screen_imv_times_filt[categorical_value == "Pass"]
+
+sbt_screen_pass <- sbt_screen_pass[, .SD[1], by = hospitalization_id]
+
+sbt_screen_pass[, time_to_successful_sbt := as.numeric(difftime(recorded_dttm, begin_imv, units = "hours"))]
+
+sbt_screen_final <- sbt_screen_pass[, .(hospitalization_id, time_to_successful_sbt)]
+
+part_ten_imv_runs <- merge(part_nine_imv_runs_final, sbt_screen_final, by = "hospitalization_id", all = TRUE)
+```
+
+# PART ELEVEN: Upload CLIF Tables for Time-Dependent Covariates
+```{r}
+#Labs
+specific_lab_categories <- c("creatinine", "bilirubin_total", "platelet_count", "po2_arterial", "pco2_arterial", "ph_arterial")
+labs_time_dependent <- as.data.table(read_data(paste0(data_dir,"clif_labs", file_type), select = c("hospitalization_id", "lab_collect_dttm", "lab_category", "lab_value_numeric")))[hospitalization_id %in% part_ten_imv_runs$hospitalization_id & lab_category %in% specific_lab_categories]
+setorder(labs_time_dependent, hospitalization_id, lab_collect_dttm)
+setnames(labs_time_dependent, "lab_collect_dttm", "recorded_dttm")
+labs_time_dependent[, recorded_dttm := as.POSIXct(recorded_dttm, origin = "1970-01-01")]
+
+#Continuous Meds
+specific_med_categories <- c("norepinephrine", "vasopressin", "epinephrine", 
+                             "phenylephrine", "cisatracurium", "milrinone", "vecuronium", 
+                             "dobutamine", "dopamine", "rocuronium", "isoproterenol")
+meds_all <- as.data.table(read_data(paste0(data_dir,"clif_medication_admin_continuous", file_type), select = c("hospitalization_id", "admin_dttm", "med_dose", "med_dose_unit", "med_category", "med_group")))[hospitalization_id %in% part_ten_imv_runs$hospitalization_id & med_category %in% specific_med_categories]
+setorder(meds_all, hospitalization_id, admin_dttm)
+setnames(meds_all, "admin_dttm", "recorded_dttm")
+
+meds_time_dependent <- merge(part_ten_imv_runs, meds_all, by = "hospitalization_id", all = TRUE)
+
+meds_time_dependent <- meds_time_dependent %>%
+  mutate(med_dose = case_when(
+    !grepl("kg", med_dose_unit, ignore.case = TRUE) & !grepl("vasopressin|isoproterenol", med_category, ignore.case = TRUE) ~ med_dose / admission_weight,
+    # Otherwise Keep the original med_dose
+    TRUE ~ med_dose))
+meds_time_dependent <- meds_time_dependent[!is.na(med_category)]
+meds_time_dependent <- meds_time_dependent[, .(hospitalization_id, recorded_dttm, med_category, med_dose)]
+
+#Filtered Vitals
+time_dependent_vitals <- c("sbp", "dbp", "map", "spo2")
+vitals_time_dependent <- vitals_all[hospitalization_id %in% part_ten_imv_runs$hospitalization_id & vital_category %in% time_dependent_vitals]
+
+#Filtered Patient Assessments
+pat_assess_rass_time_dependent <- pat_assess_rass_filt[hospitalization_id %in% part_ten_imv_runs$hospitalization_id]
+pat_assess_rass_time_dependent <- pat_assess_rass_time_dependent[, .(hospitalization_id, recorded_dttm, rass_value)]
+pat_assess_rass_time_dependent[, recorded_dttm := as.POSIXct(recorded_dttm, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+pat_assess_rass_time_dependent[, rass_value := as.numeric(rass_value)]
+patient_assess_gcs_time_dependent <- patient_assessments[hospitalization_id %in% part_ten_imv_runs$hospitalization_id & assessment_category == "gcs_total"]
+pat_assess_gcs_time_dependent <- patient_assess_gcs_time_dependent[, .(hospitalization_id, recorded_dttm, assessment_category, numerical_value)]
+#patient_assess_camicu_time_dependent <- patient_assessments[hospitalization_id %in% part_ten_imv_runs$hospitalization_id & assessment_category == "cam_total"]
+#pat_assess_camicu_time_dependent <- patient_assess_camicu_time_dependent[, .(hospitalization_id, recorded_dttm, assessment_category, categorical_value)]
+
+```
+
+# PART TWELVE: Perform Data Transformations - Long to Wide
+```{r}
+# Vitals
+vitals_time_dependent_wide <- dcast(vitals_time_dependent, 
+                   hospitalization_id + recorded_dttm ~ vital_category, 
+                   value.var = "vital_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+setorder(vitals_time_dependent_wide, hospitalization_id, recorded_dttm)
+
+# Calculate MAP values
+vitals_time_dependent_wide <- vitals_time_dependent_wide %>%
+  mutate(map = case_when(
+    is.na(map) | map == "" | map == 0 ~ (1/3 * sbp) + (2/3 * dbp),
+    TRUE ~ map
+  ))
+vitals_time_dependent_wide <- vitals_time_dependent_wide[, .(hospitalization_id, recorded_dttm, map, spo2)]
+
+vitals_time_dependent_wide[, recorded_dttm := as.POSIXct(recorded_dttm, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+
+# Labs
+labs_time_dependent_wide <- dcast(labs_time_dependent, 
+                   hospitalization_id + recorded_dttm ~ lab_category, 
+                   value.var = "lab_value_numeric", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+setorder(labs_time_dependent_wide, hospitalization_id, recorded_dttm)
+
+labs_time_dependent_wide[, recorded_dttm := as.POSIXct(recorded_dttm, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+
+# Meds
+meds_time_dependent_wide <- dcast(meds_time_dependent, 
+                   hospitalization_id + recorded_dttm ~ med_category, 
+                   value.var = "med_dose", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+setorder(meds_time_dependent_wide, hospitalization_id, recorded_dttm)
+meds_time_dependent_wide[, recorded_dttm := as.POSIXct(recorded_dttm, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+
+# Patient Assessments
+#RASS
+pat_assess_rass_time_dependent_wide <- pat_assess_rass_time_dependent
+setorder(pat_assess_rass_time_dependent_wide, hospitalization_id, recorded_dttm)
+
+#GCS
+pat_assess_gcs_time_dependent_wide <- dcast(pat_assess_gcs_time_dependent, 
+                   hospitalization_id + recorded_dttm ~ assessment_category, 
+                   value.var = "numerical_value", 
+                   fun.aggregate = mean,  # Aggregate duplicates using mean
+                   fill = NA)  # Fill missing values with NA
+setorder(pat_assess_gcs_time_dependent_wide, hospitalization_id, recorded_dttm)
+
+pat_assess_gcs_time_dependent_wide[, recorded_dttm := as.POSIXct(recorded_dttm, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+
+#CAM-ICU
+#pat_assess_camicu_time_dependent_wide <- dcast(pat_assess_camicu_time_dependent, 
+#                   hospitalization_id + recorded_dttm ~ assessment_category, 
+#                   value.var = "categorical_value",
+#                   fill = NA)  # Fill missing values with NA
+#setorder(pat_assess_camicu_time_dependent_wide, hospitalization_id, recorded_dttm)
+
+#pat_assess_camicu_time_dependent_wide[, recorded_dttm := as.POSIXct(recorded_dttm, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+
+# Respiratory
+respiratory_support_time_dependent_wide <- respiratory_support |>
+  dplyr::filter(hospitalization_id %in% part_ten_imv_runs$hospitalization_id) |>
+  dplyr::select(hospitalization_id, recorded_dttm, device_category, mode_category, fio2_set, peep_set, lpm_set, tidal_volume_set) |>
+  dplyr::mutate(
+    fio2_set = as.numeric(fio2_set),
+    lpm_set = as.numeric(lpm_set),
+    fio2_set = if (mean(fio2_set, na.rm = TRUE) > 1) fio2_set / 100 else fio2_set,
+    fio2_set = ifelse(fio2_set >= 0.21 & fio2_set <= 1, fio2_set, NA_real_),
+    lpm_set = ifelse(lpm_set >= 0 & lpm_set <= 60, lpm_set, NA_real_)
+  )
+
+respiratory_support_time_dependent_wide[, recorded_dttm := as.POSIXct(recorded_dttm, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+
+respiratory_support_time_dependent_wide <- respiratory_support_time_dependent_wide %>%
+  # Fill in device_category based on other values
+  dplyr::mutate(device_category = case_when(
+    mode_category %in% c("SIMV", "Pressure-regulated Volume Control", "Assist Control-Volume Control") ~ "IMV",
+    is.na(device_category) & fio2_set == 0.21 & is.na(lpm_set) & is.na(peep_set) & is.na(tidal_volume_set) ~ "Room Air",
+    is.na(device_category) & is.na(fio2_set) & lpm_set == 0 & is.na(peep_set) & is.na(tidal_volume_set) ~ "Room Air",
+    is.na(device_category) & is.na(fio2_set) & lpm_set >= 20 & is.na(peep_set) & is.na(tidal_volume_set) ~ "High Flow NC",
+    device_category == "Nasal Cannula" & is.na(fio2_set) & lpm_set >= 20 ~ "High Flow NC",
+    is.na(device_category) & is.na(fio2_set) & lpm_set < 20 & lpm_set > 0 & is.na(peep_set) & is.na(tidal_volume_set) ~ "Nasal Cannula",
+    TRUE ~ device_category
+  )) %>%
+  # Create fio2_combined based on existing values
+  dplyr::mutate(fio2_combined = case_when(
+    !is.na(fio2_set) ~ fio2_set,
+    is.na(fio2_set) & device_category == "Room Air" ~ 0.21,
+    is.na(fio2_set) & device_category == "Nasal Cannula" ~ (0.24 + (0.04 * lpm_set)),
+    is.na(fio2_set) & device_category == "Face Mask" & lpm_set == 6 ~ 0.35,
+    is.na(fio2_set) & device_category == "Face Mask" & lpm_set == 7 ~ 0.41,
+    is.na(fio2_set) & device_category == "Face Mask" & lpm_set == 8 ~ 0.47,
+    is.na(fio2_set) & device_category == "Face Mask" & lpm_set == 9 ~ 0.53,
+    is.na(fio2_set) & device_category == "Face Mask" & lpm_set == 10 ~ 0.60,
+    is.na(fio2_set) & device_category == "Face Mask" & lpm_set > 10 ~ 0.90,
+    TRUE ~ NA_real_
+  )) %>%
+  # Keep only the selected columns
+  dplyr::select(hospitalization_id, recorded_dttm, device_category, mode_category, lpm_set, fio2_combined)
+
+setorder(respiratory_support_time_dependent_wide, hospitalization_id, recorded_dttm)
+
+# List of tables to merge
+tables_merge_wide <- list(vitals_time_dependent_wide,
+               pat_assess_rass_time_dependent_wide,
+               labs_time_dependent_wide,
+               meds_time_dependent_wide, 
+               pat_assess_gcs_time_dependent_wide,
+               respiratory_support_time_dependent_wide)
+
+# Iterative Merge on Hospitalization_id and recorded_dttm to form time_dependent_timeline
+time_dependent_timeline_all <- reduce(tables_merge_wide, function(x, y) merge(x, y, by = c("hospitalization_id", "recorded_dttm"), all = TRUE))
+
+```
+
+
+# PART THIRTEEN: Baseline Values from 24 Hours Prior to Begin IMV
+```{r}
+# Begin IMV
+final_cohort_timestamps <- part_ten_imv_runs[, .(hospitalization_id, admission_dttm, discharge_dttm, begin_imv, end_imv, imv_duration_hours_final)]
+
+# Calculate start_time (24 hours before begin_imv)
+final_cohort_timestamps[, start_time := as.POSIXct(begin_imv) - hours(24), by = hospitalization_id]
+
+# Calculate end_time based on the condition for each hospitalization_id
+final_cohort_timestamps[, end_time := as.POSIXct(begin_imv), by = hospitalization_id]
+
+#24 Hours Prior to IMV Timeline
+time_dependent_timeline_pre_imv <- merge(final_cohort_timestamps, time_dependent_timeline_all, by = "hospitalization_id", all = TRUE)
+setorder(time_dependent_timeline_all, hospitalization_id, recorded_dttm)
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+time_dependent_timeline_pre_imv_24h <- time_dependent_timeline_pre_imv[recorded_dttm >= start_time & recorded_dttm <= end_time]
+time_dependent_timeline_pre_imv_24h <- time_dependent_timeline_pre_imv_24h[, .(hospitalization_id, recorded_dttm, begin_imv, map, spo2, rass_value, bilirubin_total, creatinine, platelet_count, po2_arterial, pco2_arterial, ph_arterial, fio2_combined, gcs_total, dopamine, dobutamine, norepinephrine, epinephrine)]
+
+#LOCF
+cols_to_update_imv_24h <- c("map", "spo2", "rass_value", "bilirubin_total", "creatinine", "platelet_count", "po2_arterial", "pco2_arterial", "ph_arterial", "fio2_combined", "gcs_total", "dopamine", "dobutamine", "norepinephrine", "epinephrine")
+time_dependent_timeline_pre_imv_24h[, (cols_to_update_imv_24h) := lapply(.SD, function(x) fifelse(x == "", NA, x)), .SDcols = cols_to_update_imv_24h]
+
+time_dependent_timeline_pre_locf <- time_dependent_timeline_pre_imv_24h[, (cols_to_update_imv_24h) := lapply(.SD, function(x) na.locf(x, na.rm = FALSE)), 
+                 by = hospitalization_id, .SDcols = cols_to_update_imv_24h]
+
+# Define columns for min and max selection
+cols_min_1 <- c("rass_value", "map", "spo2", "platelet_count", "po2_arterial", "ph_arterial", "gcs_total", "begin_imv")
+cols_max_1 <- c("bilirubin_total", "creatinine", "pco2_arterial", "fio2_combined", "dopamine", "dobutamine", 
+              "norepinephrine", "epinephrine", "recorded_dttm")
+
+# Compute the min and max for each hospitalization_id and hour_imv
+time_dependent_timeline_pre_final <- time_dependent_timeline_pre_locf[, 
+    lapply(.SD, min), by = .(hospitalization_id), .SDcols = cols_min_1][
+    time_dependent_timeline_pre_locf[, lapply(.SD, max), by = .(hospitalization_id), .SDcols = cols_max_1], 
+    on = .(hospitalization_id)
+]
+
+time_dependent_timeline_last_primary <- time_dependent_timeline_pre_final
+
+time_dependent_timeline_last_primary[, recorded_dttm := begin_imv - minutes(15)]
+time_dependent_timeline_last_primary[, hour_imv := 0]
+time_dependent_timeline_last_primary[, c("begin_imv") := NULL]
+#time_dependent_timeline_last_primary[, cam_total := NA_character_]
+
+time_dependent_timeline_last_sensitivity <- time_dependent_timeline_last_primary
+time_dependent_timeline_last_primary$rass_value <- -5
+time_dependent_timeline_last_sensitivity$rass_value <- -1
+
+```
+
+# PART FOURTEEN: Form Cox Table
+```{r}
+imv_timeline_72h <- final_cohort_timestamps[, .(
+  recorded_dttm = seq(
+    from = as.POSIXct(min(begin_imv)), 
+    to = as.POSIXct(min(begin_imv)) + hours(as.integer(pmin(72, imv_duration_hours_final))), 
+    by = "1 hour"
+  )
+), by = .(hospitalization_id)]
+
+# Calculate start_time
+imv_timeline_72h[, start_time := min(recorded_dttm, na.rm = TRUE), by = hospitalization_id]
+
+# Calculate end_time as the last recorded_dttm for each hospitalization_id
+imv_timeline_72h[, end_time := max(recorded_dttm, na.rm = TRUE), by = hospitalization_id]
+
+imv_timeline_72h[, hour_imv := seq_len(.N) - 1, by = hospitalization_id]
+
+start_end_time <- imv_timeline_72h[, .SD[1], by = hospitalization_id]
+start_end_time <- start_end_time[, .(hospitalization_id, start_time, end_time)]
+
+imv_timeline_72h[, c("start_time", "end_time") := NULL]
+
+# MERGE IT UP
+total_timeline <- merge(imv_timeline_72h, time_dependent_timeline_all, by = c("hospitalization_id", "recorded_dttm"), all = TRUE)
+setcolorder(total_timeline, c("hospitalization_id", "hour_imv", "recorded_dttm", "rass_value", "map", "spo2", "bilirubin_total", "creatinine", "platelet_count", "po2_arterial", "pco2_arterial", "ph_arterial", "fio2_combined", "gcs_total", "dopamine", "dobutamine", "norepinephrine", "epinephrine", "cisatracurium", "isoproterenol", "milrinone", "phenylephrine", "rocuronium", "vasopressin", "vecuronium"))
+
+total_timeline_filt <- merge(total_timeline, start_end_time, by = "hospitalization_id", all = TRUE)
+
+
+#LOCF
+cols_to_update_imv_total <- c("hour_imv", "rass_value", "map", "spo2", "bilirubin_total", "creatinine", "platelet_count", "po2_arterial", "pco2_arterial", "ph_arterial", "fio2_combined", "gcs_total", "dopamine", "dobutamine", "norepinephrine", "epinephrine", "cisatracurium", "isoproterenol", "milrinone", "phenylephrine", "rocuronium", "vasopressin", "vecuronium", "pao2_imputed")
+
+total_timeline_primary <- merge(total_timeline_filt, time_dependent_timeline_last_primary, by = c("hospitalization_id", "recorded_dttm", "hour_imv", "rass_value", "map", "spo2", "platelet_count", "po2_arterial", "ph_arterial", "gcs_total", "bilirubin_total", "creatinine", "pco2_arterial", "fio2_combined", "dopamine", "dobutamine", "norepinephrine", "epinephrine"), all = TRUE)
+
+total_timeline_primary[, pao2_imputed := {
+  s <- spo2 / 100
+  a <- 11700 / ((1 / s) - 1)
+  b <- sqrt(50^3 + a^2)
+  (b + a)^(1/3) - (b - a)^(1/3)
+}]
+
+total_timeline_primary[, (cols_to_update_imv_total) := lapply(.SD, function(x) fifelse(x == "", NA, x)), .SDcols = cols_to_update_imv_total]
+
+total_timeline_locf_primary <- total_timeline_primary[, (cols_to_update_imv_total) := lapply(.SD, function(x) na.locf(x, na.rm = FALSE)), 
+                 by = hospitalization_id, .SDcols = cols_to_update_imv_total]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+total_timeline_locf_primary_filt <- total_timeline_locf_primary[recorded_dttm >= start_time & recorded_dttm <= end_time]
+
+
+# Define columns for min and max selection
+cols_min <- c("rass_value", "map", "spo2", "platelet_count", "po2_arterial", "ph_arterial", "pao2_imputed", "gcs_total")
+cols_max <- c("bilirubin_total", "creatinine", "pco2_arterial", "fio2_combined", "dopamine", "dobutamine", 
+              "norepinephrine", "epinephrine", "cisatracurium", "isoproterenol", 
+              "milrinone", "phenylephrine", "rocuronium", "vasopressin", "vecuronium")
+
+# Compute the min and max for each hospitalization_id and hour_imv
+total_timeline_hourly_primary <- total_timeline_locf_primary_filt[, 
+    lapply(.SD, min), by = .(hospitalization_id, hour_imv), .SDcols = cols_min][
+    total_timeline_locf_primary_filt[, lapply(.SD, max), by = .(hospitalization_id, hour_imv), .SDcols = cols_max], 
+    on = .(hospitalization_id, hour_imv)
+]
+
+total_timeline_hourly_primary <- as.data.frame(total_timeline_hourly_primary)
+
+# Define columns to plot
+columns_to_plot <- c("rass_value", "map", "spo2", "bilirubin_total", "creatinine", "platelet_count", 
+                     "po2_arterial", "pco2_arterial", "ph_arterial", "fio2_combined", "gcs_total",
+                     "dopamine","dobutamine", "norepinephrine", "epinephrine", "isoproterenol", "milrinone",
+                     "phenylephrine", "rocuronium", "vasopressin", "vecuronium", "pao2_imputed")
+
+# Convert data to long format
+total_timeline_hourly_long <- total_timeline_hourly_primary %>%
+  select_at(vars(one_of(columns_to_plot))) %>% 
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+# Plot histograms
+histogram_plot <- ggplot(total_timeline_hourly_long, aes(x = Value)) +
+  geom_histogram(fill = "steelblue", color = "black", bins = 30) +
+  facet_wrap(~ Variable, scales = "free") +  # Adjust scales for continuous variables
+  theme_minimal() +
+  labs(title = "Histograms of Variables", x = "Value", y = "Frequency") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Save the Histogram
+ggsave(
+  filename = file.path(intermediate_dir, paste0("histograms_", institution, ".png")),
+  plot = histogram_plot,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+#Sensitivity Analysis Numbers
+cols_to_update_imv_sensitivity <- c("hour_imv", "rass_value")
+
+total_timeline_sensitivity <- merge(total_timeline_filt, time_dependent_timeline_last_sensitivity, by = c("hospitalization_id", "recorded_dttm", "hour_imv", "rass_value", "map", "spo2", "platelet_count", "po2_arterial", "ph_arterial", "gcs_total", "bilirubin_total", "creatinine", "pco2_arterial", "fio2_combined", "dopamine", "dobutamine", "norepinephrine", "epinephrine"), all = TRUE)
+
+total_timeline_sensitivity[, pao2_imputed := {
+  s <- spo2 / 100
+  a <- 11700 / ((1 / s) - 1)
+  b <- sqrt(50^3 + a^2)
+  (b + a)^(1/3) - (b - a)^(1/3)
+}]
+
+total_timeline_sensitivity[, (cols_to_update_imv_sensitivity) := lapply(.SD, function(x) fifelse(x == "", NA, x)), .SDcols = cols_to_update_imv_sensitivity]
+
+total_timeline_locf_sensitivity <- total_timeline_sensitivity[, (cols_to_update_imv_sensitivity) := lapply(.SD, function(x) na.locf(x, na.rm = FALSE)), 
+                 by = hospitalization_id, .SDcols = cols_to_update_imv_sensitivity]
+
+# Filter the table to retain rows where recorded_dttm is within the time range
+total_timeline_locf_sensitivity_filt <- total_timeline_locf_sensitivity[recorded_dttm >= start_time & recorded_dttm <= end_time]
+
+# Compute the min and max for each hospitalization_id and hour_imv
+total_timeline_hourly_sensitivity <- total_timeline_locf_sensitivity_filt[, 
+    lapply(.SD, min), by = .(hospitalization_id, hour_imv), .SDcols = cols_min][
+    total_timeline_locf_sensitivity_filt[, lapply(.SD, max), by = .(hospitalization_id, hour_imv), .SDcols = cols_max], 
+    on = .(hospitalization_id, hour_imv)
+]
+
+setDT(total_timeline_hourly_sensitivity)
+
+total_timeline_hourly_sensitivity <- total_timeline_hourly_sensitivity[, .(hospitalization_id, hour_imv, rass_value)]
+```
+
+# PART FIFTEEN: Calculate SOFA, Flag Paralysis, Merge with time independent table, calculate percent deep sedation
+```{r}
+setDT(total_timeline_hourly_primary)
+# Paralytics
+total_timeline_hourly_primary[, paralytics := fifelse(rocuronium > 0 | vecuronium > 0 | cisatracurium > 0, TRUE, FALSE)]
+total_timeline_hourly_primary[is.na(paralytics), paralytics := FALSE]
+
+# Calculate P/F Ratio
+#total_timeline_hourly[, fio2_set := fifelse(fio2_set > 1, fio2_set / 100, fio2_set)]
+total_timeline_hourly_primary[, p_to_f := po2_arterial / fio2_combined]
+total_timeline_hourly_primary[, p_to_f_imputed := pao2_imputed / fio2_combined]
+
+# Calculate SOFA
+total_timeline_hourly_primary <- total_timeline_hourly_primary %>%
+  mutate(
+    sofa_cv_97 = case_when(
+      dopamine > 15 | epinephrine > 0.1 | norepinephrine > 0.1 ~ 4,
+      dopamine > 5 | (epinephrine <= 0.1 & epinephrine > 0) | (norepinephrine <= 0.1 & norepinephrine > 0) ~ 3,
+      (dopamine <= 5 & dopamine > 0) | dobutamine > 0 ~ 2,
+      map < 70 ~ 1,
+      TRUE ~ 0
+    ),
+    sofa_coag = case_when(
+      platelet_count < 20 ~ 4,
+      platelet_count < 50 ~ 3,
+      platelet_count < 100 ~ 2,
+      platelet_count < 150 ~ 1,
+      TRUE ~ 0
+    ),
+    sofa_liver = case_when(
+      bilirubin_total >= 12.0 ~ 4,
+      bilirubin_total >= 6.0 ~ 3,
+      bilirubin_total >= 2.0 ~ 2,
+      bilirubin_total >= 1.2 ~ 1,
+      TRUE ~ 0
+    ),
+    sofa_renal = case_when(
+      creatinine >= 5.0 ~ 4,
+      creatinine >= 3.5 & creatinine < 5.0 ~ 3,
+      creatinine >= 2.0 & creatinine < 3.5 ~ 2,
+      creatinine >= 1.2 & creatinine < 2.0 ~ 1,
+      TRUE ~ 0
+    ),
+    sofa_resp_pf = case_when(
+      p_to_f < 100 ~ 4,
+      p_to_f < 200 ~ 3,
+      p_to_f < 300 ~ 2,
+      p_to_f < 400 ~ 1,
+      TRUE ~ 0
+    ),
+    sofa_resp_pf_imputed = case_when(
+      p_to_f_imputed < 100 ~ 4,
+      p_to_f_imputed < 200 ~ 3,
+      p_to_f_imputed < 300 ~ 2,
+      p_to_f_imputed < 400 ~ 1,
+      TRUE ~ 0
+    ),
+    sofa_cns = case_when(
+      gcs_total < 6 ~ 4,
+      gcs_total >= 6 & gcs_total <= 9 ~ 3,
+      gcs_total >= 10 & gcs_total <= 12 ~ 2,
+      gcs_total >= 13 & gcs_total <= 14 ~ 1,
+      TRUE ~ 0
+    )
+  )
+
+# Compute the total SOFA score
+total_timeline_hourly_primary <- copy(total_timeline_hourly_primary)
+total_timeline_hourly_primary[, total_sofa := 
+  sofa_cv_97 + sofa_coag + sofa_liver + sofa_renal +
+  fcoalesce(sofa_resp_pf, sofa_resp_pf_imputed) +
+  sofa_cns
+]
+
+pre_imv_sofa_score <- total_timeline_hourly_primary[, .SD[1], by = hospitalization_id]
+pre_imv_sofa_score <- pre_imv_sofa_score[, .(hospitalization_id, total_sofa)]
+
+#total_timeline_hourly_rass_filter <- total_timeline_hourly[!is.na(RASS)]
+
+# Deep Sedation Flag
+total_timeline_hourly_rass_filter <- total_timeline_hourly_primary[, 
+  deep_sedation_hourly := fifelse(is.na(rass_value), NA, fifelse(rass_value <= -3, TRUE, FALSE))
+]
+
+# Respiratory Acidosis Flag
+total_timeline_hourly_rass_filter[, respiratory_acidosis := fcoalesce(ph_arterial <= 7.20 & pco2_arterial >= 60, FALSE)]
+
+
+# Merge with Time Independent Table
+independent_dependent_merge <- merge(total_timeline_hourly_rass_filter, part_ten_imv_runs, by = "hospitalization_id", all = TRUE)
+
+# Determine Continuous Paralytics Started at Intubation
+time_to_first_paralytic <- independent_dependent_merge[, .(
+  time_to_first_paralytic = if (any(paralytics == TRUE)) min(hour_imv[paralytics == TRUE]) else NA_real_
+), by = hospitalization_id]
+
+time_to_first_paralytic <- time_to_first_paralytic[, paralyzed_at_intubation := fifelse(!is.na(time_to_first_paralytic) & time_to_first_paralytic <= 4, TRUE, FALSE)]
+
+# Determine Baseline SOFA
+baseline_sofa <- independent_dependent_merge[, .SD[1], by = hospitalization_id, .SDcols = "total_sofa"]
+
+#Calculate Percent Deep Sedation for total 72 hours
+deep_sedation_count_total_72 <- independent_dependent_merge[
+  deep_sedation_hourly == TRUE, 
+  .N, 
+  by = hospitalization_id
+]
+setnames(deep_sedation_count_total_72, "N", "deep_sedation_count_total_72")
+deep_sedation_count_total_72[, deep_sedation_count_total_72 := deep_sedation_count_total_72 - 1]
+
+
+row_count_minus_one_72 <- independent_dependent_merge[
+  , .(hours_mechanically_ventilated_72 = .N - 1), 
+  by = hospitalization_id
+]
+
+sedation_and_imv_72 <- merge(row_count_minus_one_72, deep_sedation_count_total_72, by = "hospitalization_id", all = TRUE)
+
+# Replace NA values in deep_sedation_count_total_72 with 0
+setnafill(sedation_and_imv_72, cols = "deep_sedation_count_total_72", fill = 0)
+
+sedation_and_imv_72[, percent_deep_sedation_72 := (deep_sedation_count_total_72 / hours_mechanically_ventilated_72) * 100]
+
+
+#Calculate Percent Deep Sedation for First 48 Hours
+independent_dependent_merge_48 <- independent_dependent_merge[hour_imv >= 1 & hour_imv <= 48]
+
+deep_sedation_count_total_48 <- independent_dependent_merge_48[
+  deep_sedation_hourly == TRUE, 
+  .N, 
+  by = hospitalization_id
+]
+setnames(deep_sedation_count_total_48, "N", "deep_sedation_count_total_48")
+deep_sedation_count_total_48[, deep_sedation_count_total_48 := deep_sedation_count_total_48]
+
+
+row_count_48 <- independent_dependent_merge_48[
+  , .(hours_mechanically_ventilated_48 = .N), 
+  by = hospitalization_id
+]
+
+sedation_and_imv_48 <- merge(row_count_48, deep_sedation_count_total_48, by = "hospitalization_id", all = TRUE)
+
+# Replace NA values in deep_sedation_count_total_48 with 0
+setnafill(sedation_and_imv_48, cols = "deep_sedation_count_total_48", fill = 0)
+
+sedation_and_imv_48[, percent_deep_sedation_48 := (deep_sedation_count_total_48 / hours_mechanically_ventilated_48) * 100]
+
+
+#Calculate Percent Deep Sedation first 48 hours for non Paralysis
+deep_sedation_count_total_48_unparalyzed <- independent_dependent_merge_48[
+  deep_sedation_hourly == TRUE & paralytics == FALSE, 
+  .N, 
+  by = hospitalization_id
+]
+setnames(deep_sedation_count_total_48_unparalyzed, "N", "deep_sedation_count_total_48_unparalyzed")
+
+hours_unparalyzed <- independent_dependent_merge_48[
+  paralytics == FALSE, 
+  .N, 
+  by = hospitalization_id
+]
+setnames(hours_unparalyzed, "N", "hours_unparalyzed_48")
+
+
+sedation_and_imv_48_unparalyzed <- merge(hours_unparalyzed, deep_sedation_count_total_48_unparalyzed, by = "hospitalization_id", all = TRUE)
+
+# Replace NA values in deep_sedation_count_total_48 with 0
+setnafill(sedation_and_imv_48_unparalyzed, cols = "deep_sedation_count_total_48_unparalyzed", fill = 0)
+setnafill(sedation_and_imv_48_unparalyzed, cols = "hours_unparalyzed_48", fill = 0)
+
+#Calculate Percentage
+sedation_and_imv_48_unparalyzed[, percent_deep_sedation_48_unparalyzed := (deep_sedation_count_total_48_unparalyzed / hours_unparalyzed_48) * 100]
+
+
+##########
+#Negative 1 Imputation Sensitivity Analysis
+# Deep Sedation Flag
+total_timeline_hourly_rass_sensitivity <- total_timeline_hourly_sensitivity[, 
+  deep_sedation_hourly := fifelse(is.na(rass_value), NA, fifelse(rass_value <= -3, TRUE, FALSE))
+]
+
+#Calculate Percent Deep Sedation
+total_timeline_hourly_rass_sensitivity_48 <- total_timeline_hourly_rass_sensitivity[hour_imv >= 0 & hour_imv <= 48]
+
+deep_sedation_count_total_48_sensitivity <- total_timeline_hourly_rass_sensitivity_48[
+  deep_sedation_hourly == TRUE, 
+  .N, 
+  by = hospitalization_id
+]
+setnames(deep_sedation_count_total_48_sensitivity, "N", "deep_sedation_count_total_48_sensitivity")
+deep_sedation_count_total_48_sensitivity[, deep_sedation_count_total_48_sensitivity := deep_sedation_count_total_48_sensitivity - 1]
+
+
+row_count_minus_one_48_sensitivity <- total_timeline_hourly_rass_sensitivity_48[
+  , .(hours_mechanically_ventilated_48_sensitivity = .N - 1), 
+  by = hospitalization_id
+]
+
+sedation_and_imv_48_sensitivity <- merge(row_count_minus_one_48_sensitivity, deep_sedation_count_total_48_sensitivity, by = "hospitalization_id", all = TRUE)
+
+# Replace NA values in deep_sedation_count_total_48 with 0
+setnafill(sedation_and_imv_48_sensitivity, cols = "deep_sedation_count_total_48_sensitivity", fill = 0)
+
+sedation_and_imv_48_sensitivity[, percent_deep_sedation_48_sensitivity := (deep_sedation_count_total_48_sensitivity / hours_mechanically_ventilated_48_sensitivity) * 100]
+
+sedation_and_imv_48_sensitivity[, .(hospitalization_id, percent_deep_sedation_48_sensitivity)]
+
+#CAM ICU
+#Identify CAM value in 24-hours prior to IMV - if any values are positive then patient is positive, if patient only has negative values they are negative, if they do not possess values then they are NA
+
+#cam_values_pre_imv <- time_dependent_timeline_pre_imv_24h
+
+#baseline_cam <- cam_values_pre_imv[
+#  , .(baseline_cam = ifelse(
+#      any(cam_total == "Positive", na.rm = TRUE), 
+#      "Positive", 
+#      ifelse(all(cam_total %in% c("Negative", "UTA"), na.rm = TRUE), "Negative", "Unknown")
+#  )), 
+#  by = hospitalization_id
+#]
+
+#cam_values_imv_48 <- total_timeline_locf_primary_filt %>%
+#  filter(hour_imv >= 1 & hour_imv <= 48)
+
+#imv_cam <- cam_values_imv_48[
+#  , .(imv_cam = ifelse(
+#      any(cam_total == "Positive", na.rm = TRUE), 
+#      "Positive", 
+#      ifelse(all(cam_total %in% c("Negative"), na.rm = TRUE), "Negative", "Unknown")
+#  )), 
+#  by = hospitalization_id
+#]
+
+#cam_table <- merge(baseline_cam, imv_cam, by = "hospitalization_id", all = TRUE)
+
+##########
+
+#Time to first rass
+
+time_to_first_rass_analysis <- time_to_first_rass_final[hospitalization_id %in% part_ten_imv_runs$hospitalization_id]
+
+# Complete Time_independent_table for primary analysis
+# List of tables to merge
+primary_analysis_tables <- list(part_ten_imv_runs, 
+               time_to_first_paralytic,
+               baseline_sofa, 
+               sedation_and_imv_72,
+               sedation_and_imv_48,
+               sedation_and_imv_48_sensitivity,
+               sedation_and_imv_48_unparalyzed,
+               time_to_first_rass_analysis)
+
+# Iterative Merge on Hospitalization_id to form primary analysis analytic
+primary_analysis_raw <- reduce(primary_analysis_tables, function(x, y) merge(x, y, by = "hospitalization_id", all = TRUE))
+
+# Replace NA values in rass_below_minus_3_count with 0
+setnafill(primary_analysis_raw, cols = "rass_below_minus_3_count", fill = 0)
+
+primary_analysis_analytic <- primary_analysis_raw[, .(hospitalization_id, admission_dttm, discharge_dttm, admission_type_category, hospital_admission_source, discharge_category, begin_imv, end_imv, imv_duration_hours_final, imv_duration_days, age_at_admission, age_category, sex_category, race_category, ethnicity_category, language_name, language_cat, death_dttm, admission_weight, admission_height, bmi, hospital_id, icu_type, hospital_icu_id, icu_admission_source, total_sofa, reintubation, trached, time_to_first_paralytic, time_to_first_rass, hours_mechanically_ventilated_72, percent_deep_sedation_48, percent_deep_sedation_72, percent_deep_sedation_48_sensitivity, percent_deep_sedation_48_unparalyzed, deep_sedation_count_total_48, deep_sedation_weighted, deep_sedation_unweighted, rass_weighted_avg, death_during_admission, vfd_clean, hfd_6m, thirty_day_mortality, time_to_successful_sbt)]
+
+write_parquet(primary_analysis_analytic, paste0(intermediate_dir, "analytic_file", institution, ".parquet"))
+
+```
+
+# PART SIXTEEN: Data Cleaning Summary
+```{r}
+data_cleaning_summary <- data.table(
+  Stage = c(
+    "Total Hospitalizations", 
+    "Documented hospitalizations with IMV",
+    "Removed (Repeat episodes of IMV)",
+    "Removed (IMV < 24 hours)",
+    "Runs with IMV > 24 hours",
+    "Removed (Patients with Trach)",
+    "Removed (Intubated at OSH)",
+    "Removed (Intubated in Procedure over 8 hours long)",
+    "Removed (Missing hospital_id, icu_type, icu_admission_source)",
+    "Removed (Missing BMI Data)",
+    "Removed (No RASS within 8 hours of IMV)",
+    "Removed (Unknown or Non-verbal Language and age outside of range)",
+    "Final Cohort"
+  ),
+  Table_Name = c(
+    "hospitalization", 
+    "imv_hospitalizations",
+    "reintubations",
+    "first_imv_runs - part_two_imv_runs",
+    "part_two_imv_runs",
+    "part_two_imv_runs - part_three_imv_runs",
+    "part_three_imv_runs - part_four_imv_runs",
+    "procedural_rows",
+    "part_four_imv_runs - procedural_rows - part_five_imv_runs",
+    "part_five_imv_runs - part_seven_imv_runs",
+    "part_seven_imv_runs - part_eight_imv_runs",
+    "part_eight_imv_runs - xx_part_eight_filt",
+    "xx_part_eight_filt"
+  ),
+  Row_Count = c(
+    nrow(hospitalization), 
+    nrow(imv_hospitalizations),
+    nrow(reintubations),
+    nrow(first_imv_runs) - nrow(part_two_imv_runs),
+    nrow(part_two_imv_runs),
+    nrow(part_two_imv_runs) - nrow(part_three_imv_runs),
+    nrow(part_three_imv_runs) - nrow(part_four_imv_runs),
+    nrow(procedural_rows),
+    nrow(part_four_imv_runs) - nrow(procedural_rows) - nrow(part_five_imv_runs),
+    nrow(part_five_imv_runs) - nrow(part_seven_imv_runs),
+    nrow(part_seven_imv_runs) - nrow(part_eight_imv_runs),
+    nrow(part_eight_imv_runs) - nrow(xx_part_eight_filt),
+    nrow(xx_part_eight_filt)
+  )
+)
+
+fwrite(data_cleaning_summary, file = paste0(output_dir, institution, "_cohort_data_cleaning_summary.csv"))
+```

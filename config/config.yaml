@@ -1,0 +1,4 @@
+data_dir: "/share/projects/data/circe/v20250331/clif/" #Insert your data_directory here
+output_dir: "/share/projects/data/circe/clif_ats_2024/language_manuscript/" #Insert where to put output data
+file_type: ".parquet" #Insert your file type here - acceptable inputs are .csv, .csv.gz, .parquet, .fst
+institution: "Penn" #Insert your institution here
