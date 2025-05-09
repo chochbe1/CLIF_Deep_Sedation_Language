@@ -578,7 +578,7 @@ hosp_height_weight_all <- hosp_height_weight_all[, .(hospitalization_id, patient
 setorder(hosp_height_weight_all, patient_id, admission_dttm)
 
 #Merge Cohort and Height Weight Hospitalizations
-hosp_height_weight_filt <- merge(hosp_height_weight_all, hospitalization_table_part_seven, by = "patient_id", all.x = TRUE)
+hosp_height_weight_filt <- merge(hosp_height_weight_all, hospitalization_table_part_seven, by = "patient_id", allow.cartesian = TRUE)
 hosp_height_weight_filt <- hosp_height_weight_filt %>%
   filter(admission_dttm >= `12_months_before` & admission_dttm <= `12_months_after`)
 setDT(hosp_height_weight_filt)
