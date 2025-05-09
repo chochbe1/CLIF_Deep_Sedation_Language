@@ -419,14 +419,39 @@ location_of_intubation <- adt_imv_non_procedural %>%
   filter(!is.na(location_of_intubation) & location_of_intubation != "") %>%
   dplyr::select(hospitalization_id, location_of_intubation, intubation_time = begin_imv)
 
+#icu_location_of_imv <- adt_imv_non_procedural[
+#  , {
+#    intubation_index <- which(location_of_intubation_flag == #TRUE)[1]
+#    if (!is.na(intubation_index)) {
+#      if (location_category[intubation_index] == "icu") {
+#        .SD[intubation_index]  # Use the intubation row itself
+#      } else {
+#        icu_index <- which(location_category == "icu" & .I > #intubation_index)[1]
+#        if (!is.na(icu_index)) .SD[icu_index] else NULL
+#      }
+#    } else {
+#      NULL
+#    }
+#  },
+#  by = hospitalization_id
+#]
+
 icu_location_of_imv <- adt_imv_non_procedural[
   , {
+    # Identify the index of the intubation row
     intubation_index <- which(location_of_intubation_flag == TRUE)[1]
+    
+    # Proceed only if an intubation row was found
     if (!is.na(intubation_index)) {
-      if (location_category[intubation_index] == "icu") {
-        .SD[intubation_index]  # Use the intubation row itself
+      
+      # Check if the intubation row is in the ICU
+      if (!is.na(location_category[intubation_index]) && location_category[intubation_index] == "icu") {
+        .SD[intubation_index]  # Use the intubation row itself if it's ICU
       } else {
+        # Find the first ICU location after the intubation row
         icu_index <- which(location_category == "icu" & .I > intubation_index)[1]
+        
+        # Return the ICU row if it exists
         if (!is.na(icu_index)) .SD[icu_index] else NULL
       }
     } else {
@@ -435,6 +460,7 @@ icu_location_of_imv <- adt_imv_non_procedural[
   },
   by = hospitalization_id
 ]
+
 icu_location_of_imv <- icu_location_of_imv[, .(hospitalization_id, location_type)]
 setnames(icu_location_of_imv, "location_type", "imv_icu")
 
@@ -532,108 +558,91 @@ patient_assessments <- unique(patient_assessments, by = c("hospitalization_id", 
 
 ```
 
+
 # PART SEVEN: Height, Weight, and BMI Data
 ```{r}
 # Create Hospitalization Table for Filtered Hospitalizations 
 hospitalization_table_part_seven <- hospitalization[hospitalization_id %in% part_five_imv_runs$hospitalization_id]
+setnames(hospitalization_table_part_seven, "admission_dttm", "cohort_admission_dttm")
+setnames(hospitalization_table_part_seven, "discharge_dttm", "cohort_discharge_dttm")
+setnames(hospitalization_table_part_seven, "hospitalization_id", "cohort_hospitalization_id")
+hospitalization_table_part_seven[, cohort_admission_dttm := as.POSIXct(cohort_admission_dttm, tz = "UTC")]
+
+#Create time_markers
+hospitalization_table_part_seven[, `12_months_after` := add_with_rollback(cohort_admission_dttm, months(12))]
+hospitalization_table_part_seven[, `12_months_before` := add_with_rollback(cohort_admission_dttm, months(-12))]
 
 # Create Table of All Hospitalizations for Patients Filtered Above
 hosp_height_weight_all <- hospitalization[patient_id %in% hospitalization_table_part_seven$patient_id]
 hosp_height_weight_all <- hosp_height_weight_all[, .(hospitalization_id, patient_id, admission_dttm, discharge_dttm)]
 setorder(hosp_height_weight_all, patient_id, admission_dttm)
-#hosp_id_height_weight <- unique(hosp_height_weight_all$hospitalization_id)
+
+#Merge Cohort and Height Weight Hospitalizations
+hosp_height_weight_filt <- merge(hosp_height_weight_all, hospitalization_table_part_seven, by = "patient_id", all.x = TRUE)
+hosp_height_weight_filt <- hosp_height_weight_filt %>%
+  filter(admission_dttm >= `12_months_before` & admission_dttm <= `12_months_after`)
+setDT(hosp_height_weight_filt)
+
+set(hosp_height_weight_filt, j = "patient_cohort_id", 
+    value = paste(hosp_height_weight_filt$patient_id, 
+                  hosp_height_weight_filt$cohort_hospitalization_id, sep = "_"))
 
 # Create Vitals Table 
 height_weight <- c("height_cm", "weight_kg")
-vitals_bmi <- vitals_all[hospitalization_id %in% hosp_height_weight_all$hospitalization_id & vital_category %in% height_weight]
-
-# Merge Cohort Info from IMV Hospitalizations with Vitals from All patient_id Hospitalizations
-imv_bmi_merge <- merge(hosp_height_weight_all, part_five_imv_runs, 
-  by = c("hospitalization_id"), 
-  all = TRUE)
-setorder(imv_bmi_merge, patient_id, admission_dttm)
-
-# Flag rows with begin_imv and end_imv (i.e the ones corresponding to a cohort admission)
-valid_imv_rows <- imv_bmi_merge[!is.na(begin_imv) & !is.na(end_imv)]
-
-# Create a unique key for each hospitalization with valid IMV times
-valid_imv_rows[, key_id := .I]
-
-# Join on patient_id and filter only for hospitalizations within +/- one year of IMV hospitalization
-result_height_weight <- imv_bmi_merge[valid_imv_rows, on = .(patient_id), nomatch = 0][
-  admission_dttm >= (i.admission_dttm - 365*24*60*60) & 
-  admission_dttm <= (i.admission_dttm + 365*24*60*60)]
-
-# Filter BMI vitals table to only contain data hospitalizations IDed in previous step
-vitals_bmi_filt <- vitals_bmi[hospitalization_id %in% result_height_weight$hospitalization_id]
+vitals_bmi <- vitals_all[hospitalization_id %in% hosp_height_weight_filt$hospitalization_id & vital_category %in% height_weight]
 
 # Reshape the data to put height/weight into separate columns, using mean to handle duplicates
-vitals_bmi_filt <- dcast(vitals_bmi_filt, 
+vitals_bmi_wide <- dcast(vitals_bmi, 
                    hospitalization_id + recorded_dttm ~ vital_category, 
                    value.var = "vital_value", 
                    fun.aggregate = mean,  # Aggregate duplicates using mean
                    fill = NA)  # Fill missing values with NA
-vitals_bmi_filt <- vitals_bmi_filt[, .(hospitalization_id, recorded_dttm, weight_kg, height_cm)]
-setorder(vitals_bmi_filt, hospitalization_id, recorded_dttm)
+vitals_bmi_wide <- vitals_bmi_wide[, .(hospitalization_id, recorded_dttm, weight_kg, height_cm)]
+setorder(vitals_bmi_wide, hospitalization_id, recorded_dttm)
 
 # Obtain Patient_IDs associated with BMI Hospitalizations and merge with reshaped table
-pat_hosp_list <- imv_bmi_merge[, .(patient_id, hospitalization_id)]
-vitals_bmi_patient <- merge(vitals_bmi_filt, pat_hosp_list, by = "hospitalization_id", all = TRUE)
-setorder(vitals_bmi_patient, patient_id, recorded_dttm)
+pat_hosp_list <- hosp_height_weight_filt[, .(patient_id, hospitalization_id, patient_cohort_id, cohort_admission_dttm, cohort_hospitalization_id)]
+vitals_bmi_patient <- merge(vitals_bmi_wide, pat_hosp_list, by = "hospitalization_id", all = TRUE)
+setorder(vitals_bmi_patient, hospitalization_id, recorded_dttm)
 
 # Table of All Height Values - filter out very low values
 height_patient <- vitals_bmi_patient[!is.na(height_cm)]
-height_patient <- height_patient[, .(patient_id, recorded_dttm, height_cm)]
+height_patient <- height_patient[, .(patient_cohort_id, hospitalization_id, cohort_hospitalization_id, cohort_admission_dttm, recorded_dttm, height_cm)]
 height_patient <- height_patient[height_cm >= 100]
 
 # Find Median Height for each Patient within +/- 1 year of IMV hospitalization
 median_height_per_patient <- height_patient[, .(
   median_height = median(height_cm, na.rm = TRUE)
-), by = patient_id]
+), by = patient_cohort_id]
 
-height_hosp <- merge(median_height_per_patient, hosp_height_weight_all, by = "patient_id", all.x = TRUE)
-height_hosp <- height_hosp[, .(hospitalization_id, median_height)]
+height_hosp <- merge(median_height_per_patient, hosp_height_weight_filt, by = "patient_cohort_id", all.x = TRUE)
+height_hosp <- height_hosp[, .(hospitalization_id, patient_cohort_id, cohort_hospitalization_id, median_height)]
+height_hosp_filtered <- height_hosp[
+  hospitalization_id == cohort_hospitalization_id
+]
 
 # Create Weight Table and filter out improbably low weights
 weight_patient <- vitals_bmi_patient[!is.na(weight_kg)]
-weight_patient <- weight_patient[, .(patient_id, hospitalization_id, recorded_dttm, weight_kg)]
+weight_patient <- weight_patient[, .(patient_cohort_id, hospitalization_id, cohort_hospitalization_id, cohort_admission_dttm, recorded_dttm, weight_kg)]
 weight_patient <- weight_patient[weight_kg >= 35]
 
-# Create table to obtain admission_dttm for all hospitalizations for IMV patients
-admission_dttm_table <- hosp_height_weight_all[
-  patient_id %in% weight_patient$patient_id, 
-  .(hospitalization_id, patient_id, admission_dttm)]
-
-# Add admission_dttm to the weight_patient table
-admission_weight_table <- merge(
-  admission_dttm_table, weight_patient,
-  by = c("hospitalization_id", "patient_id"), 
-  all = TRUE)
-setorder(admission_weight_table, hospitalization_id, recorded_dttm)
-
 # Calculate absolute time difference between admission_dttm and recorded_dttm
-admission_weight_table[, time_diff := abs(difftime(admission_dttm, recorded_dttm, units = "secs"))]
+weight_patient[, time_diff := abs(difftime(cohort_admission_dttm, recorded_dttm, units = "secs"))]
 
 # For each patient_id and admission_dttm, find the row with the minimum time_diff
-admission_weight_table[, .SD[which.min(time_diff)], by = .(patient_id, admission_dttm), .SDcols = c("admission_dttm", "weight_kg")]
+admission_weight_table <- weight_patient[, .SD[which.min(time_diff)], by = .(patient_cohort_id, cohort_admission_dttm), .SDcols = c("cohort_admission_dttm", "weight_kg")]
 
 # Create the final table with patient_id, admission_dttm, and admission_weight
-final_weight_table <- admission_weight_table[, .SD[which.min(time_diff)], by = .(patient_id, admission_dttm), .SDcols = c("admission_dttm", "weight_kg")]
-final_weight_table[, admission_weight := weight_kg]
-final_weight_table <- final_weight_table[, .(patient_id, admission_dttm, admission_weight)]
-
-# Weight Table
-weight_hosp <- merge(final_weight_table, hosp_height_weight_all, c("patient_id", "admission_dttm"), all = TRUE)
-weight_hosp <- weight_hosp[, .(hospitalization_id, admission_weight)]
+final_weight_table <- admission_weight_table[, .(patient_cohort_id, weight_kg)]
 
 # Create BMI Table, heigh_m column, and calculate BMI
-patient_bmi_data <- merge(weight_hosp, height_hosp, by = c("hospitalization_id"), 
+patient_bmi_data <- merge(final_weight_table, height_hosp_filtered, by = c("patient_cohort_id"), 
   all = TRUE)
 patient_bmi_data[, height_m := median_height / 100]
-patient_bmi_data[, bmi := admission_weight / (height_m^2)]
+patient_bmi_data[, bmi := weight_kg / (height_m^2)]
 
 # Cleaned BMI Table
-patient_bmi_data_clean <- patient_bmi_data[, .(hospitalization_id, admission_weight, median_height, bmi)]
+patient_bmi_data_clean <- patient_bmi_data[, .(hospitalization_id, weight_kg, median_height, bmi)]
 setnames(patient_bmi_data_clean, "median_height", "admission_height")
 
 # BMI/Height/Weight Data for Hospitalizations Through Part Six
