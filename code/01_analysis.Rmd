@@ -792,8 +792,17 @@ micu_only_cohort$race_category <- relevel(as.factor(micu_only_cohort$race_catego
 micu_only_cohort$ethnicity_category <- relevel(as.factor(micu_only_cohort$ethnicity_category), ref = "Non-Hispanic/Unknown")
 
 
+if(n_distinct(micu_only_cohort$hospital_icu_id) > 1) {
+  
 subgroup_model_micu <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
                data = micu_only_cohort)
+  
+} else {
+
+subgroup_model_micu <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi,
+               data = micu_only_cohort)
+  
+}
 
 summary(subgroup_model_micu)
 
