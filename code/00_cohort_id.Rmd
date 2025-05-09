@@ -1018,7 +1018,9 @@ sbt_screen_imv_times <- merge(sbt_screen_filt, part_nine_imv_runs, by = "hospita
 
 sbt_screen_imv_times_filt <- sbt_screen_imv_times[recorded_dttm >= begin_imv]
 
-sbt_screen_pass <- sbt_screen_imv_times_filt[categorical_value == "Pass"]
+sbt_screen_pass <- sbt_screen_imv_times_filt[
+  categorical_value %in% c("Pass", "pass")
+]
 
 sbt_screen_pass <- sbt_screen_pass[, .SD[1], by = hospitalization_id]
 
