@@ -395,7 +395,7 @@ setDT(adt_imv_filt)
 procedural_hours <- adt_imv_filt[
   (procedural_intubation == TRUE & location_category == "procedural") |
   (procedural_intubation == TRUE & shift(location_category == "procedural", type = "lag") & location_of_intubation_flag == TRUE),
-  .(procedural_hours = as.numeric(difftime(out_dttm, in_dttm, units = "hours"))),
+  .(procedural_hours = sum(as.numeric(difftime(out_dttm, in_dttm, units = "hours")), na.rm = TRUE)),
   by = hospitalization_id
 ]
 
