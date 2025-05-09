@@ -904,7 +904,7 @@ cohort_admissions[, `6_month` := add_with_rollback(cohort_admission_dttm, months
 hosp_hfd <- hospitalization[patient_id %in% patient_demographics_final_cohort$patient_id]
 
 #Merge with cohort_admissions
-hfd_calc <- merge(hosp_hfd, cohort_admissions, by = "patient_id", all.x = TRUE)
+hfd_calc <- merge(hosp_hfd, cohort_admissions, by = "patient_id", allow.cartesian = TRUE)
 
 #Filter hosp_hfd only for those between cohort_admission_dttm and 6 months of cohort_admission_dttm
 hfd_calc_filtered <- hfd_calc %>%
