@@ -93,7 +93,7 @@ raw_analytic_file$icu_type <- factor(
   raw_analytic_file$icu_type,
   levels = c("cardiac_icu", "general_icu", "medical_icu", 
              "mixed_cardiothoracic_icu", "mixed_neuro_icu", 
-             "surgical_icu", "trauma_icu", "burn_icu", "mixed_cardiothoracic_surgical_icu"),
+             "surgical_icu", "trauma_icu", "burn_icu", "cardiothoracic_surgical_icu"),
   labels = c("Cardiac ICU", "General ICU", "Medical ICU", 
              "Mixed Cardiothoracic ICU", "Mixed Neuro ICU", 
              "Surgical ICU", "Trauma ICU", "Burn ICU", "Cardiothoracic Surgical ICU")
