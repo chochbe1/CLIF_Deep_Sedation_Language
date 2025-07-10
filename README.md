@@ -9,7 +9,7 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
 ### To build cohort
 * `patient_assessments`
     - `hospitalization_id`, `recorded_dttm`, `numerical_value`, `categorical_value`
-    - `assessment_category %in% c("RASS", "gcs_total", "sbt_screen_pass_fail")`
+    - `assessment_category %in% c("RASS", "gcs_total")`
 * `vitals`
     - `hospitalization_id`, `recorded_dttm`, `vital_value`
     - `vital_catgories %in% c("height_cm", "weight_kg", "sbp", "dbp", "map", "spo2")`
@@ -18,13 +18,13 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
     - `lab_category %in% c("creatinine", "bilirubin_total", "platelet_count", "po2_arterial", "pco2_arterial", "ph_arterial")`
 * `medication_admin_continuous`
     - `hospitalization_id`, `admin_dttm`, `med_dose`, `med_dose_unit`
-    - `med_category %in% c("norepinephrine", "vasopressin", "epinephrine", "phenylephrine", "cisatracurium", "milrinone", "vecuronium", "dobutamine", "dopamine", "rocuronium", "isoproterenol")`
+    - `med_group %in% c("vasoactives", "sedation", "paralytics")`
 * `ADT`
     - `hospitalization_id`, `hospital_id`, `in_dttm`, `out_dttm`, `location_category`, `location_type`
 * `hospitalization`
-    - `patient_id`, `hospitalization_id`, `age_at_admission`, `admission_dttm`, `discharge_dttm`, `admission_type_category`, `discharge_category`
+    - `patient_id`, `hospitalization_id`, `age_at_admission`, `admission_dttm`, `discharge_dttm`, `admission_type_category`, `5_digit_zipcode`, `discharge_category`
 * `patient`
-    - Need complete table including: `patient_id`, `language_name`, `death_dttm`, `race_category`, `sex_category`, `ethnicity_category`
+    - Need complete table including: `patient_id`, `language_category`, `death_dttm`, `race_category`, `sex_category`, `ethnicity_category`
 * `respiratory_support`
     - `hospitalization_id`, `recorded_dttm`, `device_category`, `mode_category`, `tracheostomy`, `fio2_set`, `peep_set`, `lpm_set`, `tidal_volume_set`
     - `device_category %in% c("IMV", "Trach Collar")`
