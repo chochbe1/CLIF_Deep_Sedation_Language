@@ -41,7 +41,7 @@ Adults with documented IMV periods >24 hours. There are no date constraints.
 ## Expected Results - Please upload the following to Box
 * final_data folder - 31 total files - 2 data clenaing summaries, 2 LAPS2 missing summaries, 1 language count, 1 histogram, 1 primary analysis, 13 sensitivity analyses, 8 secondary analyses, 3 subgroup analyses
 * final_tables folder - 13 total files
-* secondary_project folder - 62 files
+* secondary_project folder - 63 files
 
 ## Detailed Instructions
 1. Update yaml file in config folder with base directory, location to store project files, file type, and institution
