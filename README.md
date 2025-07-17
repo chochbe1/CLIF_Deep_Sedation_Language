@@ -12,34 +12,36 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
     - `assessment_category %in% c("RASS", "gcs_total")`
 * `vitals`
     - `hospitalization_id`, `recorded_dttm`, `vital_value`
-    - `vital_catgories %in% c("height_cm", "weight_kg", "sbp", "dbp", "map", "spo2")`
+    - `vital_catgories %in% c("height_cm", "weight_kg", "sbp", "dbp", "map", "spo2", "temp_c", "heart_rate", "respiratory_rate")`
 * `labs`
     - `hospitalization_id`, `lab_collect_dttm`, `lab_value_numeric`
-    - `lab_category %in% c("creatinine", "bilirubin_total", "platelet_count", "po2_arterial", "pco2_arterial", "ph_arterial")`
+    - `lab_category %in% c("creatinine", "bilirubin_total", "platelet_count", "po2_arterial", "pco2_arterial", "ph_arterial", "anion_gap", "troponin_t", "troponin_i", "sodium", "bicarbonate", "chloride", "bun", "albumin", "glucose_serum", "hemoglobin", "hematocrit", "lactate", "so2_arterial", "wbc")`
 * `medication_admin_continuous`
-    - `hospitalization_id`, `admin_dttm`, `med_dose`, `med_dose_unit`
+    - `hospitalization_id`, `admin_dttm`, `med_dose`, `med_dose_unit`, `med_category`, `med_group`
     - `med_group %in% c("vasoactives", "sedation", "paralytics")`
 * `ADT`
     - `hospitalization_id`, `hospital_id`, `in_dttm`, `out_dttm`, `location_category`, `location_type`
 * `hospitalization`
-    - `patient_id`, `hospitalization_id`, `age_at_admission`, `admission_dttm`, `discharge_dttm`, `admission_type_category`, `5_digit_zipcode`, `discharge_category`
+    - `patient_id`, `hospitalization_id`, `age_at_admission`, `admission_dttm`, `discharge_dttm`, `admission_type_category`, `zipcode_five_digit`, `discharge_category`
 * `patient`
-    - Need complete table including: `patient_id`, `language_category`, `death_dttm`, `race_category`, `sex_category`, `ethnicity_category`
+    - Need: `patient_id`, `language_category`, `death_dttm`, `race_category`, `sex_category`, `ethnicity_category`
 * `respiratory_support`
     - `hospitalization_id`, `recorded_dttm`, `device_category`, `mode_category`, `tracheostomy`, `fio2_set`, `peep_set`, `lpm_set`, `tidal_volume_set`
     - `device_category %in% c("IMV", "Trach Collar")`
+* `hospital_diagnosis` 
+    - `hospitalization_id`, `diagnostic_code`, `diagnosis_code_format`
+    - Will only work with ICD-10 codes
+* `medication_admin_intermittent`
+    - `hospitalization_id`, `admin_dttm`, `med_dose`, `med_group`
+    - `med_group %in% c("paralytics")` 
  
 ## Cohort Identification
 Adults with documented IMV periods >24 hours. There are no date constraints.
 
-## Expected Results
-* Two Cohort Language Summary (html file)
-* Two Data Cleaning Summaries (csv files)
-* Two ATS Data Analysis Files (csv files)
-* Primary Analysis (csv file)
-* Ten Sensitivity Analyses (csv files)
-* Eight Secondary Analyses (csv files)
-* Two Sub-Group Analyses (csv files)
+## Expected Results - Please upload the following to Box
+* final_data folder - 31 total files - 2 data clenaing summaries, 2 LAPS2 missing summaries, 1 language count, 1 histogram, 1 primary analysis, 13 sensitivity analyses, 8 secondary analyses, 3 subgroup analyses
+* final_tables folder - 13 total files
+* secondary_project folder - 62 files
 
 ## Detailed Instructions
 1. Update yaml file in config folder with base directory, location to store project files, file type, and institution
