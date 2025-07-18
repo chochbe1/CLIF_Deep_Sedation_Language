@@ -14,7 +14,7 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
     - `hospitalization_id`, `recorded_dttm`, `vital_value`
     - `vital_catgories %in% c("height_cm", "weight_kg", "sbp", "dbp", "map", "spo2", "temp_c", "heart_rate", "respiratory_rate")`
 * `labs`
-    - `hospitalization_id`, `lab_collect_dttm`, `lab_value_numeric`
+    - `hospitalization_id`, `lab_collect_dttm`, `lab_value_numeric`, `lab_order_dttm`, `lab_category`, `lab_result_dttm`
     - `lab_category %in% c("creatinine", "bilirubin_total", "platelet_count", "po2_arterial", "pco2_arterial", "ph_arterial", "anion_gap", "troponin_t", "troponin_i", "sodium", "bicarbonate", "chloride", "bun", "albumin", "glucose_serum", "hemoglobin", "hematocrit", "lactate", "so2_arterial", "wbc")`
 * `medication_admin_continuous`
     - `hospitalization_id`, `admin_dttm`, `med_dose`, `med_dose_unit`, `med_category`, `med_group`
@@ -32,7 +32,7 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
     - `hospitalization_id`, `diagnostic_code`, `diagnosis_code_format`
     - Will only work with ICD-10 codes
 * `medication_admin_intermittent`
-    - `hospitalization_id`, `admin_dttm`, `med_dose`, `med_group`
+    - `hospitalization_id`, `admin_dttm`, `med_dose`, `med_group`, `med_category`
     - `med_group %in% c("paralytics")` 
  
 ## Cohort Identification
