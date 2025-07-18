@@ -35,7 +35,7 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
     - `hospitalization_id`, `admin_dttm`, `med_dose`, `med_group`, `med_category`
     - `med_group %in% c("paralytics")`
 * `microbiology_nonculture`
-    - `patient_id`, `hospitalization_id` `result_dttm`, `result_category`
+    - `hospitalization_id` `result_dttm`, `result_category`
  
 ## Cohort Identification
 Adults with documented IMV periods >24 hours. There are no date constraints.
