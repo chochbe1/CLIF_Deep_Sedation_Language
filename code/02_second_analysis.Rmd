@@ -1129,7 +1129,7 @@ roc_table_trach_nine <- data.frame(
 roc_table_trach_nine <- roc_table_trach_nine[order(roc_table_trach_nine$fpr), ]
 
 # Save the results to a file
-fwrite(roc_table_trach_nine, file = paste0(second_dir, institution, "_roc_table_trach_8.csv"))
+fwrite(roc_table_trach_nine, file = paste0(second_dir, institution, "_roc_table_trach_9.csv"))
 
 ```
 
@@ -1416,7 +1416,7 @@ roc_table_death_nine <- data.frame(
 roc_table_death_nine <- roc_table_death_nine[order(roc_table_death_nine$fpr), ]
 
 # Save the results to a file
-fwrite(roc_table_death_nine, file = paste0(second_dir, institution, "_roc_table_death_8.csv"))
+fwrite(roc_table_death_nine, file = paste0(second_dir, institution, "_roc_table_death_9.csv"))
 
 ```
 
@@ -1704,7 +1704,7 @@ roc_table_reintubation_nine <- data.frame(
 roc_table_reintubation_nine <- roc_table_reintubation_nine[order(roc_table_reintubation_nine$fpr), ]
 
 # Save the results to a file
-fwrite(roc_table_reintubation_nine, file = paste0(second_dir, institution, "_roc_table_reintubation_8.csv"))
+fwrite(roc_table_reintubation_nine, file = paste0(second_dir, institution, "_roc_table_reintubation_9.csv"))
 
 ```
 
