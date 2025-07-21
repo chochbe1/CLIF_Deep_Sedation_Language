@@ -1,0 +1,1744 @@
+# Project: Comparing the Predictive Performance of Measures of Early Deep Sedation
+# Author: Alex Ortiz, Nick Kuhl
+
+# Setup Step - Setup libraries
+```{r}
+# Install Packages
+
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack", "broom", "forcats", "gtsummary", "tableone", "sandwich", "lmtest", "vcd", "rsq", "pROC")
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+
+sapply(packages, install_if_missing)
+
+# Load necessary libraries
+library(data.table)
+library(dplyr)
+library(zoo)  # for na.locf function
+library(lubridate)
+library(tidyr)
+library(fst)
+library(arrow)
+library(table1)
+library(metafor)
+library(yaml)
+library(htmltools)
+library(MASS)
+library(pscl)
+library(car)
+library(broom)
+library(forcats)
+library(mediation)
+library(gtsummary)
+library(tableone)
+library(sandwich)
+library(lmtest)
+library(vcd)
+library(rsq)
+library(pROC)
+
+config <- yaml::read_yaml("config/config.yaml")
+
+# Define directories based on YAML configuration
+data_dir <- config$data_dir
+output_dir <- config$output_dir
+intermediate_dir <- file.path(output_dir, "intermediate_data/")  # Define output_dir based on data_dir
+tables_dir <- file.path(output_dir, "final_tables/")  
+final_data <- file.path(output_dir, "final_data/")
+second_dir <- file.path(output_dir, "secondary_project/")
+file_type <- config$file_type
+institution <- config$institution
+
+dirs_to_create <- c(intermediate_dir, tables_dir, final_data, second_dir)
+for (dir in dirs_to_create) {
+  if (!dir.exists(dir)) {
+    dir.create(dir, recursive = TRUE)
+  }
+}
+
+```
+
+#Upload Data
+```{r}
+read_data <- function(file_path, select = NULL) {
+  if (grepl("\\.csv$|\\.csv\\.gz$", file_path)) {
+    # Use fread with the select argument for CSV and CSV.GZ files
+    return(fread(file_path, select = all_of(select)))
+  } else if (grepl("\\.parquet$", file_path)) {
+    # Use read_parquet with col_select for Parquet files
+    return(arrow::read_parquet(file_path, col_select = all_of(select)))
+  } else if (grepl("\\.fst$", file_path)) {
+    # Use read_fst with columns for FST files
+    return(fst::read_fst(file_path, columns = all_of(select)))
+  } else {
+    stop("Unsupported file format. Only CSV, Parquet, and FST are supported.")
+  }
+}
+
+# Upload Analytic File
+total_cohort <- read_parquet(paste0(intermediate_dir, "analytic_file", institution, ".parquet"))
+
+total_cohort$icu_type <- factor(
+  total_cohort$icu_type,
+  levels = c("cardiac_icu", "general_icu", "medical_icu", 
+             "mixed_cardiothoracic_icu", "mixed_neuro_icu", "neuro_icu", "neurosurgical_icu", "surgical_icu", "trauma_icu", "burn_icu", "cardiothoracic_surgical_icu"),
+  labels = c("Cardiac ICU", "General ICU", "Medical ICU", 
+             "Mixed Cardiothoracic ICU", "Mixed Neuro ICU", "Neuro ICU", "Neurosurgical ICU", "Surgical ICU", "Trauma ICU", "Burn ICU", "Cardiothoracic Surgical ICU")
+)
+
+catVars <- c("sex_category", "ethnicity_category", "race_category", "hospital_id", "icu_type", "location_of_intubation")
+```
+
+
+#Define Cohort
+```{r}
+
+#Remove Neuro ICU Patients
+no_neuro_cohort_2 <- total_cohort[
+  !icu_type %in% c("Neuro ICU", "Neurosurgical ICU", "Mixed Neuro ICU")]
+
+#Remove No GCS
+no_gcs_cohort <- no_neuro_cohort_2[!is.na(mean_gcs)]
+
+#Remove Paralytic Patients
+final_cohort <- no_gcs_cohort[
+  (is.na(time_to_first_paralytic) & push_paralytics == 0)
+]
+
+setnafill(final_cohort, cols = "time_to_icu_admission", fill = 0)
+final_cohort[, location_of_intubation := fifelse(
+  location_of_intubation %in% c("stepdown", "rehab", "dialysis"), "other",
+  fifelse(location_of_intubation %in% c("l&d"), "ward", location_of_intubation)
+)]
+final_cohort[, health_system := institution]
+
+
+# Identify reference points for model
+final_cohort$language_category <- relevel(as.factor(final_cohort$language_category), ref = "English")
+final_cohort$sex_category <- relevel(as.factor(final_cohort$sex_category), ref = "Male")
+final_cohort$race_category <- relevel(as.factor(final_cohort$race_category), ref = "White")
+final_cohort$ethnicity_category <- relevel(as.factor(final_cohort$ethnicity_category_final), ref = "Non-Hispanic/Unknown")
+final_cohort$covid_status <- relevel(as.factor(final_cohort$covid_status), ref = "Not Detected")
+final_cohort$non_eng <- relevel(as.factor(final_cohort$non_eng), ref = "English")
+
+# Create labels for readability
+label(final_cohort$imv_duration_days) <- "<u>Days Mechanically Ventilated</u>"
+label(final_cohort$race_category) <- "<u>Race</u>"
+label(final_cohort$ethnicity_category) <- "<u>Ethnicity</u>"
+label(final_cohort$sex_category) <- "<u>Sex</u>"
+label(final_cohort$age_at_admission) <- "<u>Age</u>"
+label(final_cohort$language_category) <- "Language"
+label(final_cohort$bmi) <- "<u>BMI</u>"
+label(final_cohort$hospital_id) <- "<u>Hospital</u>"
+label(final_cohort$icu_type) <- "<u>ICU Type</u>"
+label(final_cohort$thirty_day_mortality) <- "<u>Thirty Day Mortality</u>"
+label(final_cohort$location_of_intubation) <- "<u>Location of Intubation</u>"
+label(final_cohort$elixhauser_score) <- "<u>Elixhauser Score</u>"
+label(final_cohort$SVM_SCORE) <- "<u>Social Vulnerability Metric</u>"
+label(final_cohort$laps2) <- "<u>LAPS2 Score</u>"
+label(final_cohort$time_to_first_rass) <- "<u>Time to First RASS</u>"
+label(final_cohort$rass_frequency_hrs) <- "<u>Frequency Of Rass Measurements</u>"
+label(final_cohort$non_eng) <- "<u>Language Preference</u>"
+
+
+# Generate the summary table grouped by language
+summary_table_second <- table1(
+  ~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + location_of_intubation + elixhauser_score + SVM_SCORE + time_to_first_rass + rass_frequency_hrs + non_eng + sex_category
+  | health_system, 
+  data = final_cohort,
+  factorVars = catVars,
+  test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(summary_table_second), file = paste0(second_dir, institution, "_cohort_table_one_primary_measures.html"))
+
+#vars <- c("age_at_admission", "bmi", "sex_category", "race_category", "ethnicity_category", "laps2", "hospital_id", "icu_type", "location_of_intubation", "elixhauser_score", "SVM_SCORE", "time_to_first_rass", "rass_frequency_hrs")
+#catVars <- c("sex_category", "race_category", "ethnicity_category", "hospital_id", "icu_type", "location_of_intubation")
+
+# Create table
+#table1_obj_2 <- CreateTableOne(vars = vars, strata = "sex_category",
+#                             data = final_cohort,
+#                             factorVars = catVars)
+
+# Convert the table1 object to a data frame
+#table1_df_2 <- print(table1_obj_2, smd = TRUE, nonnormal = c("age_at_admission", "bmi", "laps2", "elixhauser_score", "SVM_SCORE", #"time_to_first_rass", "rass_frequency_hrs"), printToggle = FALSE)
+
+# Save to CSV
+# Save the combined results to a file
+#fwrite(table1_df_2, file = paste0(second_dir, institution, "_IQR_SMD_Table1_primary_measures.csv"))
+```
+
+#SECTION 1: PRIMARY OUTCOMES
+#1: Proportion of time during first 48 hours (continuous)
+```{r}
+model_one <- lm(vfd_clean ~ percent_deep_sedation_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_one)
+
+r_squared_one <- summary(model_one)$r.squared
+r_squared_one  # View the value
+
+# Tidy the model summary into a data frame
+model_one_df <- broom::tidy(model_one)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_one_df <- rbind(
+  model_one_df,
+  data.frame(term = "R-squared", estimate = r_squared_one, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_one_df, file = paste0(second_dir, institution, "_28dvfd_1.csv"))
+```
+
+#2: Total time during first 48 hours (continuous)
+```{r}
+model_two <- lm(vfd_clean ~ deep_sedation_count_total_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_two)
+
+r_squared_two <- summary(model_two)$r.squared
+r_squared_two  # View the value
+
+# Tidy the model summary into a data frame
+model_two_df <- broom::tidy(model_two)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_two_df <- rbind(
+  model_two_df,
+  data.frame(term = "R-squared", estimate = r_squared_two, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_two_df, file = paste0(second_dir, institution, "_28dvfd_2.csv"))
+```
+
+#3: Median RASS Continuous
+```{r}
+model_three <- lm(vfd_clean ~ median_rass_cont + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_three)
+
+
+r_squared_three <- summary(model_three)$r.squared
+r_squared_three  # View the value
+
+# Tidy the model summary into a data frame
+model_three_df <- broom::tidy(model_three)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_three_df <- rbind(
+  model_three_df,
+  data.frame(term = "R-squared", estimate = r_squared_three, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_three_df, file = paste0(second_dir, institution, "_28dvfd_3.csv"))
+
+```
+
+#4: Median RASS Binary
+```{r}
+model_four <- lm(vfd_clean ~ median_rass_binary + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_four)
+
+
+r_squared_four <- summary(model_four)$r.squared
+r_squared_four  # View the value
+
+# Tidy the model summary into a data frame
+model_four_df <- broom::tidy(model_four)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_four_df <- rbind(
+  model_four_df,
+  data.frame(term = "R-squared", estimate = r_squared_four, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_four_df, file = paste0(second_dir, institution, "_28dvfd_4.csv"))
+```
+
+#5: RASS Weighted Average Continous
+```{r}
+model_five <- lm(vfd_clean ~ rass_weighted_avg + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_five)
+
+
+r_squared_five <- summary(model_five)$r.squared
+r_squared_five  # View the value
+
+# Tidy the model summary into a data frame
+model_five_df <- broom::tidy(model_five)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_five_df <- rbind(
+  model_five_df,
+  data.frame(term = "R-squared", estimate = r_squared_five, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_five_df, file = paste0(second_dir, institution, "_28dvfd_5.csv"))
+```
+
+#6: RASS Weighted Average Binary
+```{r}
+model_six <- lm(vfd_clean ~ deep_sedation_weighted + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_six)
+
+r_squared_six <- summary(model_six)$r.squared 
+r_squared_six  # View the value
+
+# Tidy the model summary into a data frame
+model_six_df <- broom::tidy(model_six)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_six_df <- rbind(
+  model_six_df,
+  data.frame(term = "R-squared", estimate = r_squared_six, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_six_df, file = paste0(second_dir, institution, "_28dvfd_6.csv"))
+```
+
+
+#7: Sedation Index Score
+```{r}
+model_seven <- lm(vfd_clean ~ sedation_index_score + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_seven) 
+
+r_squared_seven <- summary(model_seven)$r.squared
+r_squared_seven  # View the value
+
+# Tidy the model summary into a data frame
+model_seven_df <- broom::tidy(model_seven)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_seven_df <- rbind(
+  model_seven_df,
+  data.frame(term = "R-squared", estimate = r_squared_seven, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_seven_df, file = paste0(second_dir, institution, "_28dvfd_7.csv"))
+```
+
+#8: Mean GCS
+```{r}
+model_eight <- lm(vfd_clean ~ mean_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort) 
+
+summary(model_eight)
+
+r_squared_eight <- summary(model_eight)$r.squared
+r_squared_eight  # View the value
+
+# Tidy the model summary into a data frame
+model_eight_df <- broom::tidy(model_eight)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_eight_df <- rbind(
+  model_eight_df,
+  data.frame(term = "R-squared", estimate = r_squared_eight, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_eight_df, file = paste0(second_dir, institution, "_28dvfd_8.csv"))
+
+```
+
+#9: Median GCS
+```{r}
+model_nine <- lm(vfd_clean ~ median_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+ 
+summary(model_nine)
+
+r_squared_nine <- summary(model_nine)$r.squared
+r_squared_nine  # View the value
+
+# Tidy the model summary into a data frame
+model_nine_df <- broom::tidy(model_nine)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_nine_df <- rbind(
+  model_nine_df,
+  data.frame(term = "R-squared", estimate = r_squared_nine, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_nine_df, file = paste0(second_dir, institution, "_28dvfd_9.csv"))
+```
+
+## VFD R-Squared Tables
+```{r}
+VFD_rsquared_table <- data.table(
+  model = c("Proportion of Time", "Total Hours", "Median RASS Cont", "Median RASS Binary", "RASS Avg Cont", "RASS Avg Binary", "Sedation Index", "Mean GCS", "Median GCS"),
+  r_squared = c(r_squared_one, r_squared_two, r_squared_three, r_squared_four, r_squared_five, r_squared_six, r_squared_seven, r_squared_eight, r_squared_nine)
+)
+
+
+# Save the results to a file
+fwrite(VFD_rsquared_table, file = paste0(second_dir, institution, "_vfd_models_rsquared_table.csv"))
+```
+
+# SECTION 2: 28-Day ICU Free Days
+#1: Proportion of time during first 48 hours (continuous)
+```{r}
+model_one <- lm(icufd_28 ~ percent_deep_sedation_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_one)
+
+r_squared_one <- summary(model_one)$r.squared
+r_squared_one  # View the value
+
+# Tidy the model summary into a data frame
+model_one_df <- broom::tidy(model_one)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_one_df <- rbind(
+  model_one_df,
+  data.frame(term = "R-squared", estimate = r_squared_one, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_one_df, file = paste0(second_dir, institution, "_28dicufd_1.csv"))
+```
+
+#2: Total time during first 48 hours (continuous)
+```{r}
+model_two <- lm(icufd_28 ~ deep_sedation_count_total_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_two)
+
+r_squared_two <- summary(model_two)$r.squared
+r_squared_two  # View the value
+
+# Tidy the model summary into a data frame
+model_two_df <- broom::tidy(model_two)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_two_df <- rbind(
+  model_two_df,
+  data.frame(term = "R-squared", estimate = r_squared_two, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_two_df, file = paste0(second_dir, institution, "_28dicufd_2.csv"))
+```
+
+#3: Median RASS Continuous
+```{r}
+model_three <- lm(icufd_28 ~ median_rass_cont + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_three)
+
+
+r_squared_three <- summary(model_three)$r.squared
+r_squared_three  # View the value
+
+# Tidy the model summary into a data frame
+model_three_df <- broom::tidy(model_three)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_three_df <- rbind(
+  model_three_df,
+  data.frame(term = "R-squared", estimate = r_squared_three, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_three_df, file = paste0(second_dir, institution, "_28dicufd_3.csv"))
+
+```
+
+#4: Median RASS Binary
+```{r}
+model_four <- lm(icufd_28 ~ median_rass_binary + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_four)
+
+
+r_squared_four <- summary(model_four)$r.squared
+r_squared_four  # View the value
+
+# Tidy the model summary into a data frame
+model_four_df <- broom::tidy(model_four)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_four_df <- rbind(
+  model_four_df,
+  data.frame(term = "R-squared", estimate = r_squared_four, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_four_df, file = paste0(second_dir, institution, "_28dicufd_4.csv"))
+```
+
+#5: RASS Weighted Average Continous
+```{r}
+model_five <- lm(icufd_28 ~ rass_weighted_avg + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_five)
+
+
+r_squared_five <- summary(model_five)$r.squared
+r_squared_five  # View the value
+
+# Tidy the model summary into a data frame
+model_five_df <- broom::tidy(model_five)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_five_df <- rbind(
+  model_five_df,
+  data.frame(term = "R-squared", estimate = r_squared_five, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_five_df, file = paste0(second_dir, institution, "_28dicufd_5.csv"))
+```
+
+#6: RASS Weighted Average Binary
+```{r}
+model_six <- lm(icufd_28 ~ deep_sedation_weighted + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_six)
+
+r_squared_six <- summary(model_six)$r.squared
+r_squared_six  # View the value
+
+# Tidy the model summary into a data frame
+model_six_df <- broom::tidy(model_six)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_six_df <- rbind(
+  model_six_df,
+  data.frame(term = "R-squared", estimate = r_squared_six, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_six_df, file = paste0(second_dir, institution, "_28dicufd_6.csv"))
+```
+
+
+#7: Sedation Index Score
+```{r}
+model_seven <- lm(icufd_28 ~ sedation_index_score + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_seven)
+
+r_squared_seven <- summary(model_seven)$r.squared
+r_squared_seven  # View the value
+
+# Tidy the model summary into a data frame
+model_seven_df <- broom::tidy(model_seven)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_seven_df <- rbind(
+  model_seven_df,
+  data.frame(term = "R-squared", estimate = r_squared_seven, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_seven_df, file = paste0(second_dir, institution, "_28dicufd_7.csv"))
+```
+
+#8: Mean GCS
+```{r}
+model_eight <- lm(icufd_28 ~ mean_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_eight)
+
+r_squared_eight <- summary(model_eight)$r.squared
+r_squared_eight  # View the value
+
+# Tidy the model summary into a data frame
+model_eight_df <- broom::tidy(model_eight)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_eight_df <- rbind(
+  model_eight_df,
+  data.frame(term = "R-squared", estimate = r_squared_eight, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_eight_df, file = paste0(second_dir, institution, "_28dicufd_8.csv"))
+
+```
+
+#9: Median GCS
+```{r}
+model_nine <- lm(icufd_28 ~ median_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_nine)
+
+r_squared_nine <- summary(model_nine)$r.squared
+r_squared_nine  # View the value
+
+# Tidy the model summary into a data frame
+model_nine_df <- broom::tidy(model_nine)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_nine_df <- rbind(
+  model_nine_df,
+  data.frame(term = "R-squared", estimate = r_squared_nine, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_nine_df, file = paste0(second_dir, institution, "_28dicufd_9.csv"))
+```
+
+## ICUFD R-Squared Table
+```{r}
+ICUFD_rsquared_table <- data.table(
+  model = c("Proportion of Time", "Total Hours", "Median RASS Cont", "Median RASS Binary", "RASS Avg Cont", "RASS Avg Binary", "Sedation Index", "Mean GCS", "Median GCS"),
+  r_squared = c(r_squared_one, r_squared_two, r_squared_three, r_squared_four, r_squared_five, r_squared_six, r_squared_seven, r_squared_eight, r_squared_nine)
+)
+
+
+# Save the results to a file
+fwrite(ICUFD_rsquared_table, file = paste0(second_dir, institution, "_icufd_models_rsquared_table.csv"))
+```
+
+
+# SECTION 3: 28-Day Hospital Free Days
+#1: Proportion of time during first 48 hours (continuous)
+```{r}
+model_one <- lm(hfd_28d ~ percent_deep_sedation_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_one)
+
+r_squared_one <- summary(model_one)$r.squared
+r_squared_one  # View the value
+
+# Tidy the model summary into a data frame
+model_one_df <- broom::tidy(model_one)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_one_df <- rbind(
+  model_one_df,
+  data.frame(term = "R-squared", estimate = r_squared_one, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_one_df, file = paste0(second_dir, institution, "_28dhfd_1.csv"))
+```
+
+#2: Total time during first 48 hours (continuous)
+```{r}
+model_two <- lm(hfd_28d ~ deep_sedation_count_total_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_two)
+
+r_squared_two <- summary(model_two)$r.squared
+r_squared_two  # View the value
+
+# Tidy the model summary into a data frame
+model_two_df <- broom::tidy(model_two)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_two_df <- rbind(
+  model_two_df,
+  data.frame(term = "R-squared", estimate = r_squared_two, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_two_df, file = paste0(second_dir, institution, "_28dhfd_2.csv"))
+```
+
+#3: Median RASS Continuous
+```{r}
+model_three <- lm(hfd_28d ~ median_rass_cont + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_three)
+
+
+r_squared_three <- summary(model_three)$r.squared
+r_squared_three  # View the value
+
+# Tidy the model summary into a data frame
+model_three_df <- broom::tidy(model_three)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_three_df <- rbind(
+  model_three_df,
+  data.frame(term = "R-squared", estimate = r_squared_three, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_three_df, file = paste0(second_dir, institution, "_28dhfd_3.csv"))
+
+```
+
+#4: Median RASS Binary
+```{r}
+model_four <- lm(hfd_28d ~ median_rass_binary + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_four)
+
+
+r_squared_four <- summary(model_four)$r.squared
+r_squared_four  # View the value
+
+# Tidy the model summary into a data frame
+model_four_df <- broom::tidy(model_four)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_four_df <- rbind(
+  model_four_df,
+  data.frame(term = "R-squared", estimate = r_squared_four, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_four_df, file = paste0(second_dir, institution, "_28dhfd_4.csv"))
+```
+
+#5: RASS Weighted Average Continous
+```{r}
+model_five <- lm(hfd_28d ~ rass_weighted_avg + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_five)
+
+
+r_squared_five <- summary(model_five)$r.squared
+r_squared_five  # View the value
+
+# Tidy the model summary into a data frame
+model_five_df <- broom::tidy(model_five)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_five_df <- rbind(
+  model_five_df,
+  data.frame(term = "R-squared", estimate = r_squared_five, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_five_df, file = paste0(second_dir, institution, "_28dhfd_5.csv"))
+```
+
+#6: RASS Weighted Average Binary
+```{r}
+model_six <- lm(hfd_28d ~ deep_sedation_weighted + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_six)
+
+r_squared_six <- summary(model_six)$r.squared
+r_squared_six  # View the value
+
+# Tidy the model summary into a data frame
+model_six_df <- broom::tidy(model_six)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_six_df <- rbind(
+  model_six_df,
+  data.frame(term = "R-squared", estimate = r_squared_six, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_six_df, file = paste0(second_dir, institution, "_28dhfd_6.csv"))
+```
+
+
+#7: Sedation Index Score
+```{r}
+model_seven <- lm(hfd_28d ~ sedation_index_score + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_seven)
+
+r_squared_seven <- summary(model_seven)$r.squared
+r_squared_seven  # View the value
+
+# Tidy the model summary into a data frame
+model_seven_df <- broom::tidy(model_seven)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_seven_df <- rbind(
+  model_seven_df,
+  data.frame(term = "R-squared", estimate = r_squared_seven, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_seven_df, file = paste0(second_dir, institution, "_28dhfd_7.csv"))
+```
+
+#8: Mean GCS
+```{r}
+model_eight <- lm(hfd_28d ~ mean_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_eight)
+
+r_squared_eight <- summary(model_eight)$r.squared
+r_squared_eight  # View the value
+
+# Tidy the model summary into a data frame
+model_eight_df <- broom::tidy(model_eight)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_eight_df <- rbind(
+  model_eight_df,
+  data.frame(term = "R-squared", estimate = r_squared_eight, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_eight_df, file = paste0(second_dir, institution, "_28dhfd_8.csv"))
+
+```
+
+#9: Median GCS
+```{r}
+model_nine <- lm(hfd_28d ~ median_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission,
+               data = final_cohort)
+
+summary(model_nine)
+
+r_squared_nine <- summary(model_nine)$r.squared
+r_squared_nine  # View the value
+
+# Tidy the model summary into a data frame
+model_nine_df <- broom::tidy(model_nine)
+
+# Add R-squared as a separate row (optional but helpful for tracking)
+model_nine_df <- rbind(
+  model_nine_df,
+  data.frame(term = "R-squared", estimate = r_squared_nine, std.error = NA, statistic = NA, p.value = NA)
+)
+
+# Save the results to a file
+fwrite(model_nine_df, file = paste0(second_dir, institution, "_28dhfd_9.csv"))
+```
+
+## HFD R-Squared Table
+```{r}
+HFD_rsquared_table <- data.table(
+  model = c("Proportion of Time", "Total Hours", "Median RASS Cont", "Median RASS Binary", "RASS Avg Cont", "RASS Avg Binary", "Sedation Index", "Mean GCS", "Median GCS"),
+  r_squared = c(r_squared_one, r_squared_two, r_squared_three, r_squared_four, r_squared_five, r_squared_six, r_squared_seven, r_squared_eight, r_squared_nine)
+)
+
+# Save the results to a file
+fwrite(HFD_rsquared_table, file = paste0(second_dir, institution, "_hfd_models_rsquared_table.csv"))
+```
+
+# SECTION 4: Tracheostomy Incidence
+#1: Proportion of time during first 48 hours (continuous)
+```{r}
+secondary_model_trach_one <- glm(trached ~ percent_deep_sedation_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_trach_one)
+
+final_cohort$predicted_prob_trach_one <- predict(secondary_model_trach_one, type = "response")
+
+# Create ROC curve object
+roc_obj_trach_one <- roc(final_cohort$trached, final_cohort$predicted_prob_trach_one)
+
+# Extract AUC
+auc_value_trach_one <- auc(roc_obj_trach_one)
+print(auc_value_trach_one)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_trach_one <- data.frame(
+  threshold = roc_obj_trach_one$thresholds,
+  tpr = roc_obj_trach_one$sensitivities,
+  fpr = 1 - roc_obj_trach_one$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_trach_one <- roc_table_trach_one[order(roc_table_trach_one$fpr), ]
+
+#ggplot(roc_table_trach_one, aes(x = fpr, y = tpr)) +
+#  geom_line(color = "blue", size = 1.2) +
+#  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+#  labs(title = "ROC Curve",
+#       x = "False Positive Rate (1 - Specificity)",
+#       y = "True Positive Rate (Sensitivity)") +
+#  theme_minimal()
+
+# Save the results to a file
+fwrite(roc_table_trach_one, file = paste0(second_dir, institution, "_roc_table_trach_1.csv"))
+```
+
+
+#2: Total time during first 48 hours (continuous)
+```{r}
+secondary_model_trach_two <- glm(trached ~ deep_sedation_count_total_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_trach_two)
+
+final_cohort$predicted_prob_trach_two <- predict(secondary_model_trach_two, type = "response")
+
+# Create ROC curve object
+roc_obj_trach_two <- roc(final_cohort$trached, final_cohort$predicted_prob_trach_two)
+
+# Extract AUC
+auc_value_trach_two <- auc(roc_obj_trach_two)
+print(auc_value_trach_two)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_trach_two <- data.frame(
+  threshold = roc_obj_trach_two$thresholds,
+  tpr = roc_obj_trach_two$sensitivities,
+  fpr = 1 - roc_obj_trach_two$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_trach_two <- roc_table_trach_two[order(roc_table_trach_two$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_trach_two, file = paste0(second_dir, institution, "_roc_table_trach_2.csv"))
+
+```
+
+#3: Median RASS Continuous
+```{r}
+secondary_model_trach_three <- glm(trached ~ median_rass_cont + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_trach_three)
+
+final_cohort$predicted_prob_trach_three <- predict(secondary_model_trach_three, type = "response")
+
+# Create ROC curve object
+roc_obj_trach_three <- roc(final_cohort$trached, final_cohort$predicted_prob_trach_three)
+
+# Extract AUC
+auc_value_trach_three <- auc(roc_obj_trach_three)
+print(auc_value_trach_three)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_trach_three <- data.frame(
+  threshold = roc_obj_trach_three$thresholds,
+  tpr = roc_obj_trach_three$sensitivities,
+  fpr = 1 - roc_obj_trach_three$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_trach_three <- roc_table_trach_three[order(roc_table_trach_three$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_trach_three, file = paste0(second_dir, institution, "_roc_table_trach_3.csv"))
+
+```
+
+#4: Median RASS Binary
+```{r}
+secondary_model_trach_four <- glm(trached ~ median_rass_binary + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_trach_four)
+
+final_cohort$predicted_prob_trach_four <- predict(secondary_model_trach_four, type = "response")
+
+# Create ROC curve object
+roc_obj_trach_four <- roc(final_cohort$trached, final_cohort$predicted_prob_trach_four)
+
+# Extract AUC
+auc_value_trach_four <- auc(roc_obj_trach_four)
+print(auc_value_trach_four)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_trach_four <- data.frame(
+  threshold = roc_obj_trach_four$thresholds,
+  tpr = roc_obj_trach_four$sensitivities,
+  fpr = 1 - roc_obj_trach_four$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_trach_four <- roc_table_trach_four[order(roc_table_trach_four$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_trach_four, file = paste0(second_dir, institution, "_roc_table_trach_4.csv"))
+
+```
+
+#5: RASS Weighted Average Continous
+```{r}
+secondary_model_trach_five <- glm(trached ~ rass_weighted_avg + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_trach_five)
+
+final_cohort$predicted_prob_trach_five <- predict(secondary_model_trach_five, type = "response")
+
+# Create ROC curve object
+roc_obj_trach_five <- roc(final_cohort$trached, final_cohort$predicted_prob_trach_five)
+
+# Extract AUC
+auc_value_trach_five <- auc(roc_obj_trach_five)
+print(auc_value_trach_five)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_trach_five <- data.frame(
+  threshold = roc_obj_trach_five$thresholds,
+  tpr = roc_obj_trach_five$sensitivities,
+  fpr = 1 - roc_obj_trach_five$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_trach_five <- roc_table_trach_five[order(roc_table_trach_five$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_trach_five, file = paste0(second_dir, institution, "_roc_table_trach_5.csv"))
+
+```
+
+#6: RASS Weighted Average Binary
+```{r}
+secondary_model_trach_six <- glm(trached ~ deep_sedation_weighted + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_trach_six)
+
+final_cohort$predicted_prob_trach_six <- predict(secondary_model_trach_six, type = "response")
+
+# Create ROC curve object
+roc_obj_trach_six <- roc(final_cohort$trached, final_cohort$predicted_prob_trach_six)
+
+# Extract AUC
+auc_value_trach_six <- auc(roc_obj_trach_six)
+print(auc_value_trach_six)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_trach_six <- data.frame(
+  threshold = roc_obj_trach_six$thresholds,
+  tpr = roc_obj_trach_six$sensitivities,
+  fpr = 1 - roc_obj_trach_six$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_trach_six <- roc_table_trach_six[order(roc_table_trach_six$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_trach_six, file = paste0(second_dir, institution, "_roc_table_trach_6.csv"))
+
+```
+
+
+#7: Sedation Index Score
+```{r}
+secondary_model_trach_seven <- glm(trached ~ sedation_index_score + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_trach_seven)
+
+final_cohort$predicted_prob_trach_seven <- predict(secondary_model_trach_seven, type = "response")
+
+# Create ROC curve object
+roc_obj_trach_seven <- roc(final_cohort$trached, final_cohort$predicted_prob_trach_seven)
+
+# Extract AUC
+auc_value_trach_seven <- auc(roc_obj_trach_seven)
+print(auc_value_trach_seven)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_trach_seven <- data.frame(
+  threshold = roc_obj_trach_seven$thresholds,
+  tpr = roc_obj_trach_seven$sensitivities,
+  fpr = 1 - roc_obj_trach_seven$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_trach_seven <- roc_table_trach_seven[order(roc_table_trach_seven$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_trach_seven, file = paste0(second_dir, institution, "_roc_table_trach_7.csv"))
+```
+
+#8: Mean GCS
+```{r}
+secondary_model_trach_eight <- glm(trached ~ mean_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_trach_eight)
+
+final_cohort$predicted_prob_trach_eight <- predict(secondary_model_trach_eight, type = "response")
+
+# Create ROC curve object
+roc_obj_trach_eight <- roc(final_cohort$trached, final_cohort$predicted_prob_trach_eight)
+
+# Extract AUC
+auc_value_trach_eight <- auc(roc_obj_trach_eight)
+print(auc_value_trach_eight)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_trach_eight <- data.frame(
+  threshold = roc_obj_trach_eight$thresholds,
+  tpr = roc_obj_trach_eight$sensitivities,
+  fpr = 1 - roc_obj_trach_eight$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_trach_eight <- roc_table_trach_eight[order(roc_table_trach_eight$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_trach_eight, file = paste0(second_dir, institution, "_roc_table_trach_8.csv"))
+
+```
+
+#9: Median GCS
+```{r}
+secondary_model_trach_nine <- glm(trached ~ median_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_trach_nine)
+
+final_cohort$predicted_prob_trach_nine <- predict(secondary_model_trach_nine, type = "response")
+
+# Create ROC curve object
+roc_obj_trach_nine <- roc(final_cohort$trached, final_cohort$predicted_prob_trach_nine)
+
+# Extract AUC
+auc_value_trach_nine <- auc(roc_obj_trach_nine)
+print(auc_value_trach_nine)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_trach_nine <- data.frame(
+  threshold = roc_obj_trach_nine$thresholds,
+  tpr = roc_obj_trach_nine$sensitivities,
+  fpr = 1 - roc_obj_trach_nine$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_trach_nine <- roc_table_trach_nine[order(roc_table_trach_nine$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_trach_nine, file = paste0(second_dir, institution, "_roc_table_trach_8.csv"))
+
+```
+
+## Trach AUC Table
+```{r}
+trach_auc_table <- data.table(
+  model = c("Proportion of Time", "Total Hours", "Median RASS Cont", "Median RASS Binary", "RASS Avg Cont", "RASS Avg Binary", "Sedation Index", "Mean GCS", "Median GCS"),
+  auc = c(auc_value_trach_one, auc_value_trach_two, auc_value_trach_three, auc_value_trach_four, auc_value_trach_five, auc_value_trach_six, auc_value_trach_seven, auc_value_trach_eight, auc_value_trach_nine)
+)
+
+# Save the results to a file
+fwrite(trach_auc_table, file = paste0(second_dir, institution, "_trach_models_auc_table.csv"))
+
+```
+
+# SECTION 5: In-Hospital Mortality
+#1: Proportion of time during first 48 hours (continuous)
+```{r}
+secondary_model_death_one <- glm(death_during_admission ~ percent_deep_sedation_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_death_one)
+
+final_cohort$predicted_prob_death_one <- predict(secondary_model_death_one, type = "response")
+
+# Create ROC curve object
+roc_obj_death_one <- roc(final_cohort$death_during_admission, final_cohort$predicted_prob_death_one)
+
+# Extract AUC
+auc_value_death_one <- auc(roc_obj_death_one)
+print(auc_value_death_one)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_death_one <- data.frame(
+  threshold = roc_obj_death_one$thresholds,
+  tpr = roc_obj_death_one$sensitivities,
+  fpr = 1 - roc_obj_death_one$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_death_one <- roc_table_death_one[order(roc_table_death_one$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_death_one, file = paste0(second_dir, institution, "_roc_table_death_1.csv"))
+```
+
+
+#2: Total time during first 48 hours (continuous)
+```{r}
+secondary_model_death_two <- glm(death_during_admission ~ deep_sedation_count_total_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_death_two)
+
+final_cohort$predicted_prob_death_two <- predict(secondary_model_death_two, type = "response")
+
+# Create ROC curve object
+roc_obj_death_two <- roc(final_cohort$death_during_admission, final_cohort$predicted_prob_death_two)
+
+# Extract AUC
+auc_value_death_two <- auc(roc_obj_death_two)
+print(auc_value_death_two)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_death_two <- data.frame(
+  threshold = roc_obj_death_two$thresholds,
+  tpr = roc_obj_death_two$sensitivities,
+  fpr = 1 - roc_obj_death_two$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_death_two <- roc_table_death_two[order(roc_table_death_two$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_death_two, file = paste0(second_dir, institution, "_roc_table_death_2.csv"))
+
+```
+
+#3: Median RASS Continuous
+```{r}
+secondary_model_death_three <- glm(death_during_admission ~ median_rass_cont + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_death_three)
+
+final_cohort$predicted_prob_death_three <- predict(secondary_model_death_three, type = "response")
+
+# Create ROC curve object
+roc_obj_death_three <- roc(final_cohort$death_during_admission, final_cohort$predicted_prob_death_three)
+
+# Extract AUC
+auc_value_death_three <- auc(roc_obj_death_three)
+print(auc_value_death_three)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_death_three <- data.frame(
+  threshold = roc_obj_death_three$thresholds,
+  tpr = roc_obj_death_three$sensitivities,
+  fpr = 1 - roc_obj_death_three$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_death_three <- roc_table_death_three[order(roc_table_death_three$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_death_three, file = paste0(second_dir, institution, "_roc_table_death_3.csv"))
+
+```
+
+#4: Median RASS Binary
+```{r}
+secondary_model_death_four <- glm(death_during_admission ~ median_rass_binary + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_death_four)
+
+final_cohort$predicted_prob_death_four <- predict(secondary_model_death_four, type = "response")
+
+# Create ROC curve object
+roc_obj_death_four <- roc(final_cohort$death_during_admission, final_cohort$predicted_prob_death_four)
+
+# Extract AUC
+auc_value_death_four <- auc(roc_obj_death_four)
+print(auc_value_death_four)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_death_four <- data.frame(
+  threshold = roc_obj_death_four$thresholds,
+  tpr = roc_obj_death_four$sensitivities,
+  fpr = 1 - roc_obj_death_four$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_death_four <- roc_table_death_four[order(roc_table_death_four$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_death_four, file = paste0(second_dir, institution, "_roc_table_death_4.csv"))
+
+```
+
+#5: RASS Weighted Average Continous
+```{r}
+secondary_model_death_five <- glm(death_during_admission ~ rass_weighted_avg + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_death_five)
+
+final_cohort$predicted_prob_death_five <- predict(secondary_model_death_five, type = "response")
+
+# Create ROC curve object
+roc_obj_death_five <- roc(final_cohort$death_during_admission, final_cohort$predicted_prob_death_five)
+
+# Extract AUC
+auc_value_death_five <- auc(roc_obj_death_five)
+print(auc_value_death_five)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_death_five <- data.frame(
+  threshold = roc_obj_death_five$thresholds,
+  tpr = roc_obj_death_five$sensitivities,
+  fpr = 1 - roc_obj_death_five$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_death_five <- roc_table_death_five[order(roc_table_death_five$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_death_five, file = paste0(second_dir, institution, "_roc_table_death_5.csv"))
+
+```
+
+#6: RASS Weighted Average Binary
+```{r}
+secondary_model_death_six <- glm(death_during_admission ~ deep_sedation_weighted + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_death_six)
+
+final_cohort$predicted_prob_death_six <- predict(secondary_model_death_six, type = "response")
+
+# Create ROC curve object
+roc_obj_death_six <- roc(final_cohort$death_during_admission, final_cohort$predicted_prob_death_six)
+
+# Extract AUC
+auc_value_death_six <- auc(roc_obj_death_six)
+print(auc_value_death_six)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_death_six <- data.frame(
+  threshold = roc_obj_death_six$thresholds,
+  tpr = roc_obj_death_six$sensitivities,
+  fpr = 1 - roc_obj_death_six$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_death_six <- roc_table_death_six[order(roc_table_death_six$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_death_six, file = paste0(second_dir, institution, "_roc_table_death_6.csv"))
+
+```
+
+
+#7: Sedation Index Score
+```{r}
+secondary_model_death_seven <- glm(death_during_admission ~ sedation_index_score + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_death_seven)
+
+final_cohort$predicted_prob_death_seven <- predict(secondary_model_death_seven, type = "response")
+
+# Create ROC curve object
+roc_obj_death_seven <- roc(final_cohort$death_during_admission, final_cohort$predicted_prob_death_seven)
+
+# Extract AUC
+auc_value_death_seven <- auc(roc_obj_death_seven)
+print(auc_value_death_seven)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_death_seven <- data.frame(
+  threshold = roc_obj_death_seven$thresholds,
+  tpr = roc_obj_death_seven$sensitivities,
+  fpr = 1 - roc_obj_death_seven$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_death_seven <- roc_table_death_seven[order(roc_table_death_seven$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_death_seven, file = paste0(second_dir, institution, "_roc_table_death_7.csv"))
+```
+
+#8: Mean GCS
+```{r}
+secondary_model_death_eight <- glm(death_during_admission ~ mean_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_death_eight)
+
+final_cohort$predicted_prob_death_eight <- predict(secondary_model_death_eight, type = "response")
+
+# Create ROC curve object
+roc_obj_death_eight <- roc(final_cohort$death_during_admission, final_cohort$predicted_prob_death_eight)
+
+# Extract AUC
+auc_value_death_eight <- auc(roc_obj_death_eight)
+print(auc_value_death_eight)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_death_eight <- data.frame(
+  threshold = roc_obj_death_eight$thresholds,
+  tpr = roc_obj_death_eight$sensitivities,
+  fpr = 1 - roc_obj_death_eight$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_death_eight <- roc_table_death_eight[order(roc_table_death_eight$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_death_eight, file = paste0(second_dir, institution, "_roc_table_death_8.csv"))
+
+```
+
+#9: Median GCS
+```{r}
+secondary_model_death_nine <- glm(death_during_admission ~ median_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_death_nine)
+
+final_cohort$predicted_prob_death_nine <- predict(secondary_model_death_nine, type = "response")
+
+# Create ROC curve object
+roc_obj_death_nine <- roc(final_cohort$death_during_admission, final_cohort$predicted_prob_death_nine)
+
+# Extract AUC
+auc_value_death_nine <- auc(roc_obj_death_nine)
+print(auc_value_death_nine)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_death_nine <- data.frame(
+  threshold = roc_obj_death_nine$thresholds,
+  tpr = roc_obj_death_nine$sensitivities,
+  fpr = 1 - roc_obj_death_nine$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_death_nine <- roc_table_death_nine[order(roc_table_death_nine$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_death_nine, file = paste0(second_dir, institution, "_roc_table_death_8.csv"))
+
+```
+
+## Death AUC Table
+```{r}
+death_auc_table <- data.table(
+  model = c("Proportion of Time", "Total Hours", "Median RASS Cont", "Median RASS Binary", "RASS Avg Cont", "RASS Avg Binary", "Sedation Index", "Mean GCS", "Median GCS"),
+  auc = c(auc_value_death_one, auc_value_death_two, auc_value_death_three, auc_value_death_four, auc_value_death_five, auc_value_death_six, auc_value_death_seven, auc_value_death_eight, auc_value_death_nine)
+)
+
+# Save the results to a file
+fwrite(death_auc_table, file = paste0(second_dir, institution, "_death_models_auc_table.csv"))
+
+```
+
+
+# SECTION 6: Reintubation Incidence
+#1: Proportion of time during first 48 hours (continuous)
+```{r}
+secondary_model_reintubation_one <- glm(reintubation ~ percent_deep_sedation_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_reintubation_one)
+
+final_cohort$predicted_prob_reintubation_one <- predict(secondary_model_reintubation_one, type = "response")
+
+# Create ROC curve object
+roc_obj_reintubation_one <- roc(final_cohort$reintubation, final_cohort$predicted_prob_reintubation_one)
+
+# Extract AUC
+auc_value_reintubation_one <- auc(roc_obj_reintubation_one)
+print(auc_value_reintubation_one)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_reintubation_one <- data.frame(
+  threshold = roc_obj_reintubation_one$thresholds,
+  tpr = roc_obj_reintubation_one$sensitivities,
+  fpr = 1 - roc_obj_reintubation_one$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_reintubation_one <- roc_table_reintubation_one[order(roc_table_reintubation_one$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_reintubation_one, file = paste0(second_dir, institution, "_roc_table_reintubation_1.csv"))
+```
+
+
+#2: Total time during first 48 hours (continuous)
+```{r}
+secondary_model_reintubation_two <- glm(reintubation ~ deep_sedation_count_total_48 + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_reintubation_two)
+
+final_cohort$predicted_prob_reintubation_two <- predict(secondary_model_reintubation_two, type = "response")
+
+# Create ROC curve object
+roc_obj_reintubation_two <- roc(final_cohort$reintubation, final_cohort$predicted_prob_reintubation_two)
+
+# Extract AUC
+auc_value_reintubation_two <- auc(roc_obj_reintubation_two)
+print(auc_value_reintubation_two)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_reintubation_two <- data.frame(
+  threshold = roc_obj_reintubation_two$thresholds,
+  tpr = roc_obj_reintubation_two$sensitivities,
+  fpr = 1 - roc_obj_reintubation_two$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_reintubation_two <- roc_table_reintubation_two[order(roc_table_reintubation_two$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_reintubation_two, file = paste0(second_dir, institution, "_roc_table_reintubation_2.csv"))
+
+```
+
+#3: Median RASS Continuous
+```{r}
+secondary_model_reintubation_three <- glm(reintubation ~ median_rass_cont + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_reintubation_three)
+
+final_cohort$predicted_prob_reintubation_three <- predict(secondary_model_reintubation_three, type = "response")
+
+# Create ROC curve object
+roc_obj_reintubation_three <- roc(final_cohort$reintubation, final_cohort$predicted_prob_reintubation_three)
+
+# Extract AUC
+auc_value_reintubation_three <- auc(roc_obj_reintubation_three)
+print(auc_value_reintubation_three)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_reintubation_three <- data.frame(
+  threshold = roc_obj_reintubation_three$thresholds,
+  tpr = roc_obj_reintubation_three$sensitivities,
+  fpr = 1 - roc_obj_reintubation_three$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_reintubation_three <- roc_table_reintubation_three[order(roc_table_reintubation_three$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_reintubation_three, file = paste0(second_dir, institution, "_roc_table_reintubation_3.csv"))
+
+```
+
+#4: Median RASS Binary
+```{r}
+secondary_model_reintubation_four <- glm(reintubation ~ median_rass_binary + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_reintubation_four)
+
+final_cohort$predicted_prob_reintubation_four <- predict(secondary_model_reintubation_four, type = "response")
+
+# Create ROC curve object
+roc_obj_reintubation_four <- roc(final_cohort$reintubation, final_cohort$predicted_prob_reintubation_four)
+
+# Extract AUC
+auc_value_reintubation_four <- auc(roc_obj_reintubation_four)
+print(auc_value_reintubation_four)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_reintubation_four <- data.frame(
+  threshold = roc_obj_reintubation_four$thresholds,
+  tpr = roc_obj_reintubation_four$sensitivities,
+  fpr = 1 - roc_obj_reintubation_four$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_reintubation_four <- roc_table_reintubation_four[order(roc_table_reintubation_four$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_reintubation_four, file = paste0(second_dir, institution, "_roc_table_reintubation_4.csv"))
+
+```
+
+#5: RASS Weighted Average Continous
+```{r}
+secondary_model_reintubation_five <- glm(reintubation ~ rass_weighted_avg + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_reintubation_five)
+
+final_cohort$predicted_prob_reintubation_five <- predict(secondary_model_reintubation_five, type = "response")
+
+# Create ROC curve object
+roc_obj_reintubation_five <- roc(final_cohort$reintubation, final_cohort$predicted_prob_reintubation_five)
+
+# Extract AUC
+auc_value_reintubation_five <- auc(roc_obj_reintubation_five)
+print(auc_value_reintubation_five)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_reintubation_five <- data.frame(
+  threshold = roc_obj_reintubation_five$thresholds,
+  tpr = roc_obj_reintubation_five$sensitivities,
+  fpr = 1 - roc_obj_reintubation_five$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_reintubation_five <- roc_table_reintubation_five[order(roc_table_reintubation_five$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_reintubation_five, file = paste0(second_dir, institution, "_roc_table_reintubation_5.csv"))
+
+```
+
+#6: RASS Weighted Average Binary
+```{r}
+secondary_model_reintubation_six <- glm(reintubation ~ deep_sedation_weighted + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_reintubation_six)
+
+final_cohort$predicted_prob_reintubation_six <- predict(secondary_model_reintubation_six, type = "response")
+
+# Create ROC curve object
+roc_obj_reintubation_six <- roc(final_cohort$reintubation, final_cohort$predicted_prob_reintubation_six)
+
+# Extract AUC
+auc_value_reintubation_six <- auc(roc_obj_reintubation_six)
+print(auc_value_reintubation_six)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_reintubation_six <- data.frame(
+  threshold = roc_obj_reintubation_six$thresholds,
+  tpr = roc_obj_reintubation_six$sensitivities,
+  fpr = 1 - roc_obj_reintubation_six$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_reintubation_six <- roc_table_reintubation_six[order(roc_table_reintubation_six$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_reintubation_six, file = paste0(second_dir, institution, "_roc_table_reintubation_6.csv"))
+
+```
+
+
+#7: Sedation Index Score
+```{r}
+secondary_model_reintubation_seven <- glm(reintubation ~ sedation_index_score + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_reintubation_seven)
+
+final_cohort$predicted_prob_reintubation_seven <- predict(secondary_model_reintubation_seven, type = "response")
+
+# Create ROC curve object
+roc_obj_reintubation_seven <- roc(final_cohort$reintubation, final_cohort$predicted_prob_reintubation_seven)
+
+# Extract AUC
+auc_value_reintubation_seven <- auc(roc_obj_reintubation_seven)
+print(auc_value_reintubation_seven)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_reintubation_seven <- data.frame(
+  threshold = roc_obj_reintubation_seven$thresholds,
+  tpr = roc_obj_reintubation_seven$sensitivities,
+  fpr = 1 - roc_obj_reintubation_seven$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_reintubation_seven <- roc_table_reintubation_seven[order(roc_table_reintubation_seven$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_reintubation_seven, file = paste0(second_dir, institution, "_roc_table_reintubation_7.csv"))
+```
+
+#8: Mean GCS
+```{r}
+secondary_model_reintubation_eight <- glm(reintubation ~ mean_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_reintubation_eight)
+
+final_cohort$predicted_prob_reintubation_eight <- predict(secondary_model_reintubation_eight, type = "response")
+
+# Create ROC curve object
+roc_obj_reintubation_eight <- roc(final_cohort$reintubation, final_cohort$predicted_prob_reintubation_eight)
+
+# Extract AUC
+auc_value_reintubation_eight <- auc(roc_obj_reintubation_eight)
+print(auc_value_reintubation_eight)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_reintubation_eight <- data.frame(
+  threshold = roc_obj_reintubation_eight$thresholds,
+  tpr = roc_obj_reintubation_eight$sensitivities,
+  fpr = 1 - roc_obj_reintubation_eight$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_reintubation_eight <- roc_table_reintubation_eight[order(roc_table_reintubation_eight$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_reintubation_eight, file = paste0(second_dir, institution, "_roc_table_reintubation_8.csv"))
+
+```
+
+#9: Median GCS
+```{r}
+secondary_model_reintubation_nine <- glm(reintubation ~ median_gcs + non_eng + race_category + age_category + sex_category + ethnicity_category + bmi + factor(hospital_icu_id) + elixhauser_score + laps2 + location_of_intubation + covid_status + time_to_icu_admission, data = final_cohort, 
+                                  family = binomial(link = "logit"))
+summary(secondary_model_reintubation_nine)
+
+final_cohort$predicted_prob_reintubation_nine <- predict(secondary_model_reintubation_nine, type = "response")
+
+# Create ROC curve object
+roc_obj_reintubation_nine <- roc(final_cohort$reintubation, final_cohort$predicted_prob_reintubation_nine)
+
+# Extract AUC
+auc_value_reintubation_nine <- auc(roc_obj_reintubation_nine)
+print(auc_value_reintubation_nine)
+
+# Get the sensitivity and 1 - specificity values
+roc_table_reintubation_nine <- data.frame(
+  threshold = roc_obj_reintubation_nine$thresholds,
+  tpr = roc_obj_reintubation_nine$sensitivities,
+  fpr = 1 - roc_obj_reintubation_nine$specificities
+)
+
+# Optional: sort by FPR for plotting
+roc_table_reintubation_nine <- roc_table_reintubation_nine[order(roc_table_reintubation_nine$fpr), ]
+
+# Save the results to a file
+fwrite(roc_table_reintubation_nine, file = paste0(second_dir, institution, "_roc_table_reintubation_8.csv"))
+
+```
+
+## Reintubation AUC Table
+```{r}
+reintubation_auc_table <- data.table(
+  model = c("Proportion of Time", "Total Hours", "Median RASS Cont", "Median RASS Binary", "RASS Avg Cont", "RASS Avg Binary", "Sedation Index", "Mean GCS", "Median GCS"),
+  auc = c(auc_value_reintubation_one, auc_value_reintubation_two, auc_value_reintubation_three, auc_value_reintubation_four, auc_value_reintubation_five, auc_value_reintubation_six, auc_value_reintubation_seven, auc_value_reintubation_eight, auc_value_reintubation_nine)
+)
+
+# Save the results to a file
+fwrite(reintubation_auc_table, file = paste0(second_dir, institution, "_reintubation_models_auc_table.csv"))
+
+```
+
+# Data Cleaning Summary
+```{r}
+data_cleaning_summary_analysis_second <- data.table(
+  Stage = c(
+    "Patients Removed for Admission to Neuro or Neurosurgical ICUs",
+    "Patients Removed for missing GCS values",
+    "Patients Removed for Receiving Paralytics in first 48Hrs"
+ ),
+  Table_Name = c(
+    "total_cohort - no_neuro_cohort_2", 
+    "no_neuro_cohort_2 - no_gcs_cohort",
+    "no_gcs_cohort - final_cohort"
+),
+  Row_Count = c(
+    nrow(total_cohort) - nrow(no_neuro_cohort_2), 
+    nrow(no_neuro_cohort_2) - nrow(no_gcs_cohort),
+    nrow(no_gcs_cohort) - nrow(final_cohort)
+  )
+)
+
+fwrite(data_cleaning_summary_analysis_second, file = paste0(second_dir, institution, "_analysis_data_cleaning_summary_second.csv"))
+```
