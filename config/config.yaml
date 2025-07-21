@@ -1,4 +1,5 @@
-data_dir: "" #Insert your data_directory here - make sure to have / at end
-output_dir: "" #Insert where to put output data - make sure to have / at end
-file_type: ".parquet" #Insert your file type here - acceptable inputs are .csv, .csv.gz, .parquet, .fst
-institution: "" #Insert your institution here
+data_dir: "/share/projects/data/circe/v20250630/clif/"
+output_dir: "/share/projects/data/circe/clif_ats_2024/language_manuscript_new/"
+file_type: ".parquet"
+institution: "Penn"
+time_zone: "EST"
