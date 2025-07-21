@@ -5,7 +5,7 @@
 ```{r}
 # Install Packages
 
-packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack", "broom", "forcats")
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack", "broom", "forcats", "gtsummary", "tableone", "sandwich", "lmtest", "vcd", "psych")
 install_if_missing <- function(package) {
   if (!require(package, character.only = TRUE)) {
     install.packages(package, dependencies = TRUE)
@@ -32,20 +32,33 @@ library(pscl)
 library(car)
 library(broom)
 library(forcats)
+library(mediation)
+library(gtsummary)
+library(tableone)
+library(sandwich)
+library(lmtest)
+library(vcd)
+library(psych)
 
-config <- yaml::read_yaml("config.yaml")
+config <- yaml::read_yaml("config/config.yaml")
 
 # Define directories based on YAML configuration
 data_dir <- config$data_dir
 output_dir <- config$output_dir
 intermediate_dir <- file.path(output_dir, "intermediate_data/")  # Define output_dir based on data_dir
+tables_dir <- file.path(output_dir, "final_tables/")  
+final_data <- file.path(output_dir, "final_data/")
+second_dir <- file.path(output_dir, "secondary_project/")
 file_type <- config$file_type
 institution <- config$institution
 
-# Create the output directory if it does not exist
-if (!dir.exists(intermediate_dir)) {
-  dir.create(intermediate_dir, recursive = TRUE)  # 'recursive = TRUE' allows creating nested directories
+dirs_to_create <- c(intermediate_dir, tables_dir, final_data, second_dir)
+for (dir in dirs_to_create) {
+  if (!dir.exists(dir)) {
+    dir.create(dir, recursive = TRUE)
+  }
 }
+
 ```
 
 #Upload Data
@@ -66,182 +79,516 @@ read_data <- function(file_path, select = NULL) {
 }
 
 # Upload Analytic File
-raw_analytic_file <- read_parquet(paste0(intermediate_dir, "analytic_file", institution, ".parquet"))
-raw_analytic_file[, icu_type := fifelse(icu_type == "mixed_cardiac_icu", "mixed_cardiothoracic_icu", icu_type)]
+total_cohort <- read_parquet(paste0(intermediate_dir, "analytic_file", institution, ".parquet"))
+
+total_cohort$icu_type <- factor(
+  total_cohort$icu_type,
+  levels = c("cardiac_icu", "general_icu", "medical_icu", 
+             "mixed_cardiothoracic_icu", "mixed_neuro_icu", "neuro_icu", "neurosurgical_icu", "surgical_icu", "trauma_icu", "burn_icu", "cardiothoracic_surgical_icu"),
+  labels = c("Cardiac ICU", "General ICU", "Medical ICU", 
+             "Mixed Cardiothoracic ICU", "Mixed Neuro ICU", "Neuro ICU", "Neurosurgical ICU", "Surgical ICU", "Trauma ICU", "Burn ICU", "Cardiothoracic Surgical ICU")
+)
+
+catVars <- c("sex_category", "ethnicity_category", "race_category", "hospital_id", "icu_type", "location_of_intubation")
 ```
 
-#Generate Table One - ATS Presentation
+#IPW Calculation
 ```{r}
+ipw_outcome <- total_cohort[, .(
+  reached_48h = as.integer(imv_duration_hours_final >= 48)
+), by = hospitalization_id]
 
+# Merge the reached_48h flag back to your dataset
+ipw_sensitivity_analysis <- merge(total_cohort, ipw_outcome, by = "hospitalization_id")
+
+# Use patient-level covariates to predict censoring
+ipw_model <- glm(reached_48h ~ age_category + sex_category + race_category + ethnicity_category + laps2 + factor(hospital_icu_id) + elixhauser_score,
+                 data = unique(ipw_sensitivity_analysis, by = "hospitalization_id"),
+                 family = binomial())
+
+total_cohort[, prob_reach_48h := predict(ipw_model, newdata = total_cohort, type = "response")]
+total_cohort[, ipw := 1 / prob_reach_48h]
+```
+
+# STEP ONE: Define Cohorts
+# Total Cohort for Non-English Analysis
+```{r}
 # Identify reference points for model
-raw_analytic_file$language_cat <- relevel(as.factor(raw_analytic_file$language_cat), ref = "English")
-raw_analytic_file$sex_category <- relevel(as.factor(raw_analytic_file$sex_category), ref = "Male")
-raw_analytic_file$race_category <- relevel(as.factor(raw_analytic_file$race_category), ref = "White")
-raw_analytic_file$ethnicity_category <- relevel(as.factor(raw_analytic_file$ethnicity_category), ref = "Non-Hispanic/Unknown")
+total_cohort$language_category <- relevel(as.factor(total_cohort$language_category), ref = "English")
+total_cohort$top_five_non_eng_non_spanish <- relevel(as.factor(total_cohort$top_five_non_eng_non_spanish), ref = "English")
+total_cohort$non_eng <- relevel(as.factor(total_cohort$non_eng), ref = "English")
+total_cohort$sex_category <- relevel(as.factor(total_cohort$sex_category), ref = "Male")
+total_cohort$race_category <- relevel(as.factor(total_cohort$race_category), ref = "White")
+total_cohort$ethnicity_category <- relevel(as.factor(total_cohort$ethnicity_category), ref = "Non-Hispanic")
 
-# Create labels for readability
-label(raw_analytic_file$imv_duration_days) <- "<u>Days Mechanically Ventilated</u>"
-label(raw_analytic_file$race_category) <- "<u>Race</u>"
-label(raw_analytic_file$ethnicity_category) <- "<u>Ethnicity</u>"
-label(raw_analytic_file$sex_category) <- "<u>Sex</u>"
-label(raw_analytic_file$age_at_admission) <- "<u>Age</u>"
-label(raw_analytic_file$language_cat) <- "Language"
-label(raw_analytic_file$bmi) <- "<u>BMI</u>"
-label(raw_analytic_file$total_sofa) <- "<u>Sequential Organ Failure Assessment Score</u>"
-label(raw_analytic_file$hospital_id) <- "<u>Hospital</u>"
-raw_analytic_file$icu_type <- factor(
-  raw_analytic_file$icu_type,
-  levels = c("cardiac_icu", "general_icu", "medical_icu", 
-             "mixed_cardiothoracic_icu", "mixed_neuro_icu", 
-             "surgical_icu", "trauma_icu", "burn_icu", "cardiothoracic_surgical_icu"),
-  labels = c("Cardiac ICU", "General ICU", "Medical ICU", 
-             "Mixed Cardiothoracic ICU", "Mixed Neuro ICU", 
-             "Surgical ICU", "Trauma ICU", "Burn ICU", "Cardiothoracic Surgical ICU")
-)
-label(raw_analytic_file$icu_type) <- "<u>ICU Type</u>"
-label(raw_analytic_file$thirty_day_mortality) <- "<u>Thirty Day Mortality</u>"
-
-catVars <- c("sex_category", "ethnicity_category", "race_category", "hospital_id", "icu_type", "thirty_day_mortality")
-
+#Basic Table One
 # Generate the summary table grouped by language
-summary_table_ats <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + total_sofa + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_cat, data = raw_analytic_file, factorVars = catVars, test = TRUE)
+total_cohort_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | non_eng, data = total_cohort, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
-save_html(as.tags(summary_table_ats), file = paste0(output_dir, institution, "_table_one_ats.html"))
-
+save_html(as.tags(total_cohort_table_one), file = paste0(tables_dir, institution, "_total_cohort_table_one_manuscript.html"))
 ```
 
-#Primary Analysis for ATS
+# Cohort for Top 5 non-English, non-Spanish Language
 ```{r}
-# Fit the unadjusted primary model
-primary_model_unadjusted_ats <- lm(percent_deep_sedation_48 ~ language_cat, data = raw_analytic_file)
+top_five_cohort <- total_cohort[top_five_non_eng_non_spanish %in% c("English", "top_five_non_eng_non_spanish", "Spanish")]
+top_five_cohort$top_five_non_eng_non_spanish <- relevel(as.factor(top_five_cohort$top_five_non_eng_non_spanish), ref = "English")
+top_five_cohort$non_eng <- relevel(as.factor(top_five_cohort$non_eng), ref = "English")
+top_five_cohort$sex_category <- relevel(as.factor(top_five_cohort$sex_category), ref = "Male")
+top_five_cohort$race_category <- relevel(as.factor(top_five_cohort$race_category), ref = "White")
+top_five_cohort$ethnicity_category <- relevel(as.factor(top_five_cohort$ethnicity_category), ref = "Non-Hispanic")
 
-summary(primary_model_unadjusted_ats)
+#Basic Table One
+# Generate the summary table grouped by language
+top_five_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | top_five_non_eng_non_spanish, data = top_five_cohort, factorVars = catVars, test = TRUE)
 
-# Extract coefficients, standard errors, variance, and p-values for the unadjusted model
-primary_results_unadjusted_ats <- data.frame(
-  term = names(coef(primary_model_unadjusted_ats)),
-  estimate = coef(primary_model_unadjusted_ats),
-  std.error = summary(primary_model_unadjusted_ats)$coefficients[, "Std. Error"],
-  variance = (summary(primary_model_unadjusted_ats)$coefficients[, "Std. Error"])^2,  # Calculate variance
-  p.value = summary(primary_model_unadjusted_ats)$coefficients[, "Pr(>|t|)"]  # Extract p-values
-)
-
-
-primary_model_adjusted_ats <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + ethnicity_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = raw_analytic_file)
-
-summary(primary_model_adjusted_ats)
-
-# Extract coefficients, standard errors, variance, and p-values for the adjusted model
-primary_results_adjusted_ats <- data.frame(
-  term = names(coef(primary_model_adjusted_ats)),
-  estimate = coef(primary_model_adjusted_ats),
-  std.error = summary(primary_model_adjusted_ats)$coefficients[, "Std. Error"],
-  variance = (summary(primary_model_adjusted_ats)$coefficients[, "Std. Error"])^2,
-  p.value = summary(primary_model_adjusted_ats)$coefficients[, "Pr(>|t|)"]
-)
-
-# Combine the results into one data frame
-primary_results_combined_ats <- bind_rows(
-  primary_results_unadjusted_ats %>% mutate(model = "Unadjusted"),
-  primary_results_adjusted_ats %>% mutate(model = "Adjusted")
-)
-
-# Save the combined results to a file
-fwrite(primary_results_combined_ats, file = paste0(output_dir, institution, "_primary_analysis_results_ats.csv"))
-
+# Convert to HTML and save as file
+save_html(as.tags(top_five_table_one), file = paste0(tables_dir, institution, "_top_five_cohort_table_one_manuscript.html"))
 ```
 
-#Secondary Analysis for ATS
+# Cohort for Sensitivity Analysis Involving All Spanish/English Pts regardless of ICU of admission
 ```{r}
-secondary_model_adjusted_ats <- lm(imv_duration_hours_final ~ language_cat + race_category + age_category + sex_category + ethnicity_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = raw_analytic_file)
-
-summary(secondary_model_adjusted_ats)
-
-# Extract coefficients, standard errors, variance, and p-values for the adjusted model
-secondary_results_adjusted_ats <- data.frame(
-  term = names(coef(secondary_model_adjusted_ats)),
-  estimate = coef(secondary_model_adjusted_ats),
-  std.error = summary(secondary_model_adjusted_ats)$coefficients[, "Std. Error"],
-  variance = (summary(secondary_model_adjusted_ats)$coefficients[, "Std. Error"])^2,  # Calculate variance
-  p.value = summary(secondary_model_adjusted_ats)$coefficients[, "Pr(>|t|)"]  # Extract p-values
-)
-
-# Save the combined results to a file
-fwrite(secondary_results_adjusted_ats, file = paste0(output_dir, institution, "_secondary_analysis_results_ats.csv"))
-
-```
-
-#Generate Table One for Manuscript
-```{r}
-english_spanish_primary_analysis <- raw_analytic_file[language_cat %in% c("English", "Spanish")]
-english_spanish_primary_analysis[, race_category := as.character(race_category)]
-english_spanish_primary_analysis[, race_category := fifelse(
+english_spanish_all_icu_analysis <- total_cohort[language_category %in% c("English", "Spanish")]
+english_spanish_all_icu_analysis[, race_category := as.character(race_category)]
+english_spanish_all_icu_analysis[, race_category := fifelse(
   race_category %in% c("Asian"),
   "Other/Unknown",
   race_category
 )]
 
 # Identify reference points for model
-english_spanish_primary_analysis$language_cat <- relevel(as.factor(english_spanish_primary_analysis$language_cat), ref = "English")
-english_spanish_primary_analysis$sex_category <- relevel(as.factor(english_spanish_primary_analysis$sex_category), ref = "Male")
-english_spanish_primary_analysis$race_category <- relevel(as.factor(english_spanish_primary_analysis$race_category), ref = "White")
-english_spanish_primary_analysis$ethnicity_category <- relevel(as.factor(english_spanish_primary_analysis$ethnicity_category), ref = "Non-Hispanic/Unknown")
+english_spanish_all_icu_analysis$language_category <- relevel(as.factor(english_spanish_all_icu_analysis$language_category), ref = "English")
+english_spanish_all_icu_analysis$sex_category <- relevel(as.factor(english_spanish_all_icu_analysis$sex_category), ref = "Male")
+english_spanish_all_icu_analysis$race_category <- relevel(as.factor(english_spanish_all_icu_analysis$race_category), ref = "White")
+english_spanish_all_icu_analysis$ethnicity_category <- relevel(as.factor(english_spanish_all_icu_analysis$ethnicity_category), ref = "Non-Hispanic")
 
+
+#Basic Table One
+# Generate the summary table grouped by language
+eng_span_all_icu_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = english_spanish_all_icu_analysis, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(eng_span_all_icu_table_one), file = paste0(tables_dir, institution, "_eng_span_all_icu_cohort_table_one_manuscript.html"))
+
+```
+
+# Primary Cohort for Analysis
+```{r}
 # Step 1: Count Spanish-speaking patients by hospital_icu_id
-spanish_counts <- english_spanish_primary_analysis[
-  language_cat == "Spanish", 
+spanish_counts <- english_spanish_all_icu_analysis[
+  language_category == "Spanish", 
   .N, 
   by = hospital_icu_id
 ]
 
 # Step 2: Identify hospital_icu_id values with 0 Spanish-speaking patients
 # (We do this by first getting all unique hospital_icu_id values and checking which ones are missing)
-all_hospitals <- unique(english_spanish_primary_analysis$hospital_icu_id)
+all_hospitals <- unique(english_spanish_all_icu_analysis$hospital_icu_id)
 hospitals_with_spanish <- spanish_counts$hospital_icu_id
 hospitals_to_remove <- setdiff(all_hospitals, hospitals_with_spanish)
 
 # Step 3: Filter out those hospitals from the original table
-english_spanish_primary_analysis_filtered <- english_spanish_primary_analysis[
+english_spanish_primary_analysis <- english_spanish_all_icu_analysis[
   !hospital_icu_id %in% hospitals_to_remove
 ]
 
+english_spanish_primary_analysis <- english_spanish_primary_analysis %>%
+  mutate(language_category = droplevels(language_category))
+
 # Identify reference points for model
-english_spanish_primary_analysis_filtered$language_cat <- relevel(as.factor(english_spanish_primary_analysis_filtered$language_cat), ref = "English")
-english_spanish_primary_analysis_filtered$sex_category <- relevel(as.factor(english_spanish_primary_analysis_filtered$sex_category), ref = "Male")
-english_spanish_primary_analysis_filtered$race_category <- relevel(as.factor(english_spanish_primary_analysis_filtered$race_category), ref = "White")
-english_spanish_primary_analysis_filtered$ethnicity_category <- relevel(as.factor(english_spanish_primary_analysis_filtered$ethnicity_category), ref = "Non-Hispanic/Unknown")
+english_spanish_primary_analysis$language_category <- relevel(as.factor(english_spanish_primary_analysis$language_category), ref = "English")
+english_spanish_primary_analysis$sex_category <- relevel(as.factor(english_spanish_primary_analysis$sex_category), ref = "Male")
+english_spanish_primary_analysis$race_category <- relevel(as.factor(english_spanish_primary_analysis$race_category), ref = "White")
+english_spanish_primary_analysis$ethnicity_category <- relevel(as.factor(english_spanish_primary_analysis$ethnicity_category), ref = "Non-Hispanic")
+english_spanish_primary_analysis$covid_status <- relevel(as.factor(english_spanish_primary_analysis$covid_status), ref = "Not Detected")
+english_spanish_primary_analysis$ethnicity_category_final <- relevel(as.factor(english_spanish_primary_analysis$ethnicity_category_final), ref = "Non-Hispanic/Unknown")
+english_spanish_primary_analysis$push_paralytics <- relevel(as.factor(english_spanish_primary_analysis$push_paralytics), ref = "0")
 
 # Create labels for readability
-label(english_spanish_primary_analysis_filtered$imv_duration_days) <- "<u>Days Mechanically Ventilated</u>"
-label(english_spanish_primary_analysis_filtered$race_category) <- "<u>Race</u>"
-label(english_spanish_primary_analysis_filtered$ethnicity_category) <- "<u>Ethnicity</u>"
-label(english_spanish_primary_analysis_filtered$sex_category) <- "<u>Sex</u>"
-label(english_spanish_primary_analysis_filtered$age_at_admission) <- "<u>Age</u>"
-label(english_spanish_primary_analysis_filtered$language_cat) <- "Language"
-label(english_spanish_primary_analysis_filtered$bmi) <- "<u>BMI</u>"
-label(english_spanish_primary_analysis_filtered$total_sofa) <- "<u>Sequential Organ Failure Assessment Score</u>"
-label(english_spanish_primary_analysis_filtered$hospital_id) <- "<u>Hospital</u>"
-label(english_spanish_primary_analysis_filtered$icu_type) <- "<u>ICU Type</u>"
-label(english_spanish_primary_analysis_filtered$thirty_day_mortality) <- "<u>Thirty Day Mortality</u>"
-
-catVars <- c("sex_category", "ethnicity_category", "race_category", "hospital_id", "icu_type", "thirty_day_mortality")
+label(english_spanish_primary_analysis$imv_duration_days) <- "<u>Days Mechanically Ventilated</u>"
+label(english_spanish_primary_analysis$race_category) <- "<u>Race</u>"
+label(english_spanish_primary_analysis$ethnicity_category) <- "<u>Ethnicity</u>"
+label(english_spanish_primary_analysis$sex_category) <- "<u>Sex</u>"
+label(english_spanish_primary_analysis$age_at_admission) <- "<u>Age</u>"
+label(english_spanish_primary_analysis$language_category) <- "Language"
+label(english_spanish_primary_analysis$bmi) <- "<u>BMI</u>"
+label(english_spanish_primary_analysis$hospital_id) <- "<u>Hospital</u>"
+label(english_spanish_primary_analysis$icu_type) <- "<u>ICU Type</u>"
+label(english_spanish_primary_analysis$thirty_day_mortality) <- "<u>Thirty Day Mortality</u>"
+label(english_spanish_primary_analysis$location_of_intubation) <- "<u>Location of Intubation</u>"
+label(english_spanish_primary_analysis$elixhauser_score) <- "<u>Elixhauser Score</u>"
+label(english_spanish_primary_analysis$SVM_SCORE) <- "<u>Social Vulnerability Metric</u>"
+label(english_spanish_primary_analysis$laps2) <- "<u>LAPS2 Score</u>"
+label(english_spanish_primary_analysis$time_to_first_rass) <- "<u>Time to First RASS</u>"
+label(english_spanish_primary_analysis$rass_frequency_hrs) <- "<u>Frequency Of Rass Measurements</u>"
+label(english_spanish_primary_analysis$covid_status) <- "<u>COVID Status</u>"
 
 # Generate the summary table grouped by language
-summary_table <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + total_sofa + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_cat, data = english_spanish_primary_analysis_filtered, factorVars = catVars, test = TRUE)
+summary_table <- table1(
+  ~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + location_of_intubation + elixhauser_score + SVM_SCORE + time_to_first_rass + rass_frequency_hrs + covid_status
+  | language_category, 
+  data = english_spanish_primary_analysis,
+  factorVars = catVars,
+  test = TRUE)
 
 # Convert to HTML and save as file
-save_html(as.tags(summary_table), file = paste0(output_dir, institution, "_cohort_table_one_manuscript.html"))
+save_html(as.tags(summary_table), file = paste0(tables_dir, institution, "_primary_cohort_table_one_manuscript.html"))
+
+vars <- c("age_at_admission", "bmi", "sex_category", "race_category", "ethnicity_category", "laps2", "hospital_id", "icu_type", "location_of_intubation", "elixhauser_score", "SVM_SCORE", "time_to_first_rass", "rass_frequency_hrs","covid_status")
+catVars <- c("sex_category", "race_category", "ethnicity_category", "hospital_id", "icu_type", "location_of_intubation", "covid_status")
+
+# Create table
+table1_obj <- CreateTableOne(vars = vars, strata = "language_category",
+                             data = english_spanish_primary_analysis,
+                             factorVars = catVars)
+
+# Print with SMD and nonparametric summary
+print(table1_obj, smd = TRUE, nonnormal = c("age_at_admission", "bmi"))
+
+print(table1_obj, smd = TRUE)
+
+# Convert the table1 object to a data frame
+table1_df <- print(table1_obj, smd = TRUE, nonnormal = c("age_at_admission", "bmi", "laps2", "elixhauser_score", "SVM_SCORE", "time_to_first_rass", "rass_frequency_hrs"), printToggle = FALSE)
+
+# Save to CSV
+# Save the combined results to a file
+fwrite(table1_df, file = paste0(tables_dir, institution, "_IQR_SMD_Table1.csv"))
+
+#Create paralytic_early_flag
+english_spanish_primary_analysis[, paralytic_early_flag := fifelse(
+  (time_to_first_paralytic > 0) | (push_paralytics == 1),
+  1, 0)]
+
+setnafill(english_spanish_primary_analysis, cols = "paralytic_early_flag", fill = 0)
+
+#Create Continuous Paralytic Flag
+english_spanish_primary_analysis[, paralysis_cont := fifelse(
+  (time_to_first_paralytic > 0),
+  1, 0)]
+setnafill(english_spanish_primary_analysis, cols = "paralysis_cont", fill = 0)
 
 ```
 
-#MANUSCRIPT ANALYSES
-#Primary Analysis
+#Cohort Intubated for Full 48 Hours
+```{r}
+full_48hr_cohort <- english_spanish_primary_analysis[  hours_mechanically_ventilated_72 >= 48]
+full_48hr_cohort <- full_48hr_cohort[
+  is.finite(ipw) & !is.na(ipw)]
+
+# Identify reference points for model
+full_48hr_cohort$language_category <- relevel(as.factor(full_48hr_cohort$language_category), ref = "English")
+full_48hr_cohort$sex_category <- relevel(as.factor(full_48hr_cohort$sex_category), ref = "Male")
+full_48hr_cohort$race_category <- relevel(as.factor(full_48hr_cohort$race_category), ref = "White")
+full_48hr_cohort$ethnicity_category <- relevel(as.factor(full_48hr_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+full_48hr_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = full_48hr_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(full_48hr_table_one), file = paste0(tables_dir, institution, "_full_48hr_cohort_table_one_manuscript.html"))
+```
+
+#Cohort with RASS Measurements within 2 Hours
+```{r}
+rass_2hrs_cohort <- english_spanish_primary_analysis[time_to_first_rass <= 2]
+
+# Identify reference points for model
+rass_2hrs_cohort$language_category <- relevel(as.factor(rass_2hrs_cohort$language_category), ref = "English")
+rass_2hrs_cohort$sex_category <- relevel(as.factor(rass_2hrs_cohort$sex_category), ref = "Male")
+rass_2hrs_cohort$race_category <- relevel(as.factor(rass_2hrs_cohort$race_category), ref = "White")
+rass_2hrs_cohort$ethnicity_category <- relevel(as.factor(rass_2hrs_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+rass_2hrs_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = rass_2hrs_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(rass_2hrs_table_one), file = paste0(tables_dir, institution, "_rass_2hrs_cohort_table_one_manuscript.html"))
+
+```
+
+#Cohort without Neuro_ICU patients
+```{r}
+no_neuro_cohort <- english_spanish_primary_analysis[
+  !icu_type %in% c("Neuro ICU", "Neurosurgical ICU", "Mixed Neuro ICU")]
+
+# Identify reference points for model
+no_neuro_cohort$language_category <- relevel(as.factor(no_neuro_cohort$language_category), ref = "English")
+no_neuro_cohort$sex_category <- relevel(as.factor(no_neuro_cohort$sex_category), ref = "Male")
+no_neuro_cohort$race_category <- relevel(as.factor(no_neuro_cohort$race_category), ref = "White")
+no_neuro_cohort$ethnicity_category <- relevel(as.factor(no_neuro_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+no_neuro_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = no_neuro_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(no_neuro_table_one), file = paste0(tables_dir, institution, "_no_neuro_cohort_table_one_manuscript.html"))
+
+```
+
+#Cohort without Paralytic Patients
+```{r}
+no_paralytic_cohort <- english_spanish_primary_analysis[
+  (is.na(time_to_first_paralytic) & push_paralytics == 0)
+]
+
+# Identify reference points for model
+no_paralytic_cohort$language_category <- relevel(as.factor(no_paralytic_cohort$language_category), ref = "English")
+no_paralytic_cohort$sex_category <- relevel(as.factor(no_paralytic_cohort$sex_category), ref = "Male")
+no_paralytic_cohort$race_category <- relevel(as.factor(no_paralytic_cohort$race_category), ref = "White")
+no_paralytic_cohort$ethnicity_category <- relevel(as.factor(no_paralytic_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+no_paralytic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = no_paralytic_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(no_paralytic_table_one), file = paste0(tables_dir, institution, "_no_paralytic_cohort_table_one_manuscript.html"))
+
+```
+
+#Cohort with only Paralytic Patients
+```{r}
+only_paralytic_cohort <- english_spanish_primary_analysis[!
+  (is.na(time_to_first_paralytic) & push_paralytics == 0)
+]
+
+# Identify reference points for model
+only_paralytic_cohort$language_category <- relevel(as.factor(only_paralytic_cohort$language_category), ref = "English")
+only_paralytic_cohort$sex_category <- relevel(as.factor(only_paralytic_cohort$sex_category), ref = "Male")
+only_paralytic_cohort$race_category <- relevel(as.factor(only_paralytic_cohort$race_category), ref = "White")
+only_paralytic_cohort$ethnicity_category <- relevel(as.factor(only_paralytic_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+only_paralytic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = only_paralytic_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(only_paralytic_table_one), file = paste0(tables_dir, institution, "_only_paralytic_cohort_table_one_manuscript.html"))
+
+```
+
+#Cohort removing continuous paralytic patients but keeping push paralytics
+```{r}
+no_continuous_paralytic_cohort <- english_spanish_primary_analysis[
+  (is.na(time_to_first_paralytic))]
+
+# Identify reference points for model
+no_continuous_paralytic_cohort$language_category <- relevel(as.factor(no_continuous_paralytic_cohort$language_category), ref = "English")
+no_continuous_paralytic_cohort$sex_category <- relevel(as.factor(no_continuous_paralytic_cohort$sex_category), ref = "Male")
+no_continuous_paralytic_cohort$race_category <- relevel(as.factor(no_continuous_paralytic_cohort$race_category), ref = "White")
+no_continuous_paralytic_cohort$ethnicity_category <- relevel(as.factor(no_continuous_paralytic_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+no_continuous_paralytic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = no_continuous_paralytic_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(no_continuous_paralytic_table_one), file = paste0(tables_dir, institution, "_no_continuous_paralytic_cohort_table_one_manuscript.html"))
+
+```
+
+#Cohort removing push paralytic patients but keeping continuous paralytics
+```{r}
+no_push_paralytic_cohort <- english_spanish_primary_analysis[
+  (push_paralytics == 0)
+]
+
+# Identify reference points for model
+no_push_paralytic_cohort$language_category <- relevel(as.factor(no_push_paralytic_cohort$language_category), ref = "English")
+no_push_paralytic_cohort$sex_category <- relevel(as.factor(no_push_paralytic_cohort$sex_category), ref = "Male")
+no_push_paralytic_cohort$race_category <- relevel(as.factor(no_push_paralytic_cohort$race_category), ref = "White")
+no_push_paralytic_cohort$ethnicity_category <- relevel(as.factor(no_push_paralytic_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+no_push_paralytic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = no_push_paralytic_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(no_push_paralytic_table_one), file = paste0(tables_dir, institution, "_no_push_paralytic_cohort_table_one_manuscript.html"))
+
+```
+
+#Pandemic Cohort
+```{r}
+pandemic_cohort <- english_spanish_primary_analysis[
+  admission_dttm >= as.POSIXct("2020-03-01 00:00:00")]
+
+# Identify reference points for model
+pandemic_cohort$language_category <- relevel(as.factor(pandemic_cohort$language_category), ref = "English")
+pandemic_cohort$sex_category <- relevel(as.factor(pandemic_cohort$sex_category), ref = "Male")
+pandemic_cohort$race_category <- relevel(as.factor(pandemic_cohort$race_category), ref = "White")
+pandemic_cohort$ethnicity_category <- relevel(as.factor(pandemic_cohort$ethnicity_category), ref = "Non-Hispanic")
+pandemic_cohort$covid_status <- relevel(as.factor(pandemic_cohort$covid_status), ref = "Not Detected")
+
+#Basic Table One
+# Generate the summary table grouped by language
+pandemic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + covid_status | language_category, data = pandemic_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(pandemic_table_one), file = paste0(tables_dir, institution, "_pandemic_cohort_table_one_manuscript.html"))
+
+```
+
+#Pre-Pandemic Cohort
+```{r}
+pre_pandemic_cohort <- english_spanish_primary_analysis[
+  admission_dttm < as.POSIXct("2020-03-01 00:00:00")]
+
+# Identify reference points for model
+pre_pandemic_cohort$language_category <- relevel(as.factor(pre_pandemic_cohort$language_category), ref = "English")
+pre_pandemic_cohort$sex_category <- relevel(as.factor(pre_pandemic_cohort$sex_category), ref = "Male")
+pre_pandemic_cohort$race_category <- relevel(as.factor(pre_pandemic_cohort$race_category), ref = "White")
+pre_pandemic_cohort$ethnicity_category <- relevel(as.factor(pre_pandemic_cohort$ethnicity_category), ref = "Non-Hispanic")
+pre_pandemic_cohort$covid_status <- relevel(as.factor(pre_pandemic_cohort$covid_status), ref = "Not Detected")
+
+#Basic Table One
+# Generate the summary table grouped by language
+pre_pandemic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + covid_status | language_category, data = pre_pandemic_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(pre_pandemic_table_one), file = paste0(tables_dir, institution, "_pre_pandemic_cohort_table_one_manuscript.html"))
+
+```
+
+#MICU Cohort
+```{r}
+micu_only_cohort <- english_spanish_primary_analysis[icu_type == "Medical ICU"]
+
+# Identify reference points for model
+micu_only_cohort$language_category <- relevel(as.factor(micu_only_cohort$language_category), ref = "English")
+micu_only_cohort$sex_category <- relevel(as.factor(micu_only_cohort$sex_category), ref = "Male")
+micu_only_cohort$race_category <- relevel(as.factor(micu_only_cohort$race_category), ref = "White")
+micu_only_cohort$ethnicity_category <- relevel(as.factor(micu_only_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+micu_only_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = micu_only_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(micu_only_table_one), file = paste0(tables_dir, institution, "_micu_only_table_one_manuscript.html"))
+
+```
+
+#Hispanic Cohort
+```{r}
+hispanic_cohort <- english_spanish_primary_analysis[ethnicity_category == "Hispanic"]
+
+# Identify reference points for model
+hispanic_cohort$language_category <- relevel(as.factor(hispanic_cohort$language_category), ref = "English")
+hispanic_cohort$sex_category <- relevel(as.factor(hispanic_cohort$sex_category), ref = "Male")
+hispanic_cohort$race_category <- relevel(as.factor(hispanic_cohort$race_category), ref = "White")
+hispanic_cohort$ethnicity_category <- relevel(as.factor(hispanic_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+hispanic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = hispanic_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(hispanic_table_one), file = paste0(tables_dir, institution, "_hispanic_table_one_manuscript.html"))
+
+```
+
+#Non-Hispanic / Unknown Cohort
+```{r}
+non_hispanic_cohort <- english_spanish_primary_analysis[ethnicity_category_final == "Non-Hispanic/Unknown"]
+
+# Identify reference points for model
+non_hispanic_cohort$language_category <- relevel(as.factor(non_hispanic_cohort$language_category), ref = "English")
+non_hispanic_cohort$sex_category <- relevel(as.factor(non_hispanic_cohort$sex_category), ref = "Male")
+non_hispanic_cohort$race_category <- relevel(as.factor(non_hispanic_cohort$race_category), ref = "White")
+non_hispanic_cohort$ethnicity_category <- relevel(as.factor(non_hispanic_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+non_hispanic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = non_hispanic_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(non_hispanic_table_one), file = paste0(tables_dir, institution, "_non_hispanic_table_one_manuscript.html"))
+
+```
+
+#Ethnicity/Language Re-Classification Cohort
+```{r}
+language_reclass_cohort <- copy(english_spanish_primary_analysis)
+language_reclass_cohort[
+  ethnicity_category == "Unknown" & language_category == "Spanish",
+  ethnicity_category := "Hispanic"
+]
+
+language_reclass_cohort[
+  ethnicity_category == "Unknown" & language_category == "English",
+  ethnicity_category := "Non-Hispanic"
+]
+
+language_reclass_cohort[
+  ethnicity_category == "Non-Hispanic" & language_category == "Spanish",
+  ethnicity_category := "Hispanic"
+]
+
+# Identify reference points for model
+language_reclass_cohort$language_category <- relevel(as.factor(language_reclass_cohort$language_category), ref = "English")
+language_reclass_cohort$sex_category <- relevel(as.factor(language_reclass_cohort$sex_category), ref = "Male")
+language_reclass_cohort$race_category <- relevel(as.factor(language_reclass_cohort$race_category), ref = "White")
+language_reclass_cohort$ethnicity_category <- relevel(as.factor(language_reclass_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+language_reclass_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = language_reclass_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(language_reclass_table_one), file = paste0(tables_dir, institution, "_language_reclass_table_one_manuscript.html"))
+
+```
+
+#Cohort wihout unknown patients
+```{r}
+no_unknown_ethnicity_cohort <- english_spanish_primary_analysis[
+  ethnicity_category != "Unknown"
+]
+
+# Identify reference points for model
+no_unknown_ethnicity_cohort$language_category <- relevel(as.factor(no_unknown_ethnicity_cohort$language_category), ref = "English")
+no_unknown_ethnicity_cohort$sex_category <- relevel(as.factor(no_unknown_ethnicity_cohort$sex_category), ref = "Male")
+no_unknown_ethnicity_cohort$race_category <- relevel(as.factor(no_unknown_ethnicity_cohort$race_category), ref = "White")
+no_unknown_ethnicity_cohort$ethnicity_category <- relevel(as.factor(no_unknown_ethnicity_cohort$ethnicity_category), ref = "Non-Hispanic")
+
+#Basic Table One
+# Generate the summary table grouped by language
+no_unknown_ethnicity_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = no_unknown_ethnicity_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(no_unknown_ethnicity_table_one), file = paste0(tables_dir, institution, "_no_unknown_ethnicity_table_one_manuscript.html"))
+
+```
+
+#Non-English Analysis Cohort without Paralytic Patients
+```{r}
+non_english_no_paralytic_cohort <- total_cohort[
+  (is.na(time_to_first_paralytic) & push_paralytics == 0)
+]
+
+# Identify reference points for model
+non_english_no_paralytic_cohort$language_category <- relevel(as.factor(non_english_no_paralytic_cohort$language_category), ref = "English")
+non_english_no_paralytic_cohort$sex_category <- relevel(as.factor(non_english_no_paralytic_cohort$sex_category), ref = "Male")
+non_english_no_paralytic_cohort$race_category <- relevel(as.factor(non_english_no_paralytic_cohort$race_category), ref = "White")
+non_english_no_paralytic_cohort$ethnicity_category <- relevel(as.factor(non_english_no_paralytic_cohort$ethnicity_category), ref = "Non-Hispanic")
+non_english_no_paralytic_cohort$non_eng <- relevel(as.factor(non_english_no_paralytic_cohort$non_eng), ref = "English")
+
+#Basic Table One
+# Generate the summary table grouped by language
+non_english_no_paralytic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | non_eng, data = non_english_no_paralytic_cohort, factorVars = catVars, test = TRUE)
+
+# Convert to HTML and save as file
+save_html(as.tags(non_english_no_paralytic_table_one), file = paste0(tables_dir, institution, "_non_english_no_paralytic_cohort_table_one.html"))
+```
+
+#STEP 2: PRIMARY ANALYSIS
 ```{r}
 # Fit the unadjusted primary model
-primary_model_unadjusted <- lm(percent_deep_sedation_48 ~ language_cat, data = english_spanish_primary_analysis_filtered)
+primary_model_unadjusted <- lm(percent_deep_sedation_48 ~ language_category, data = english_spanish_primary_analysis)
 
 summary(primary_model_unadjusted)
 
@@ -254,8 +601,8 @@ primary_results_unadjusted <- data.frame(
   p.value = summary(primary_model_unadjusted)$coefficients[, "Pr(>|t|)"]  # Extract p-values
 )
 
-primary_model_adjusted <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = english_spanish_primary_analysis_filtered)
+primary_model_adjusted <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
 
 summary(primary_model_adjusted)
 
@@ -275,14 +622,14 @@ primary_results_combined <- bind_rows(
 )
 
 # Save the combined results to a file
-fwrite(primary_results_combined, file = paste0(output_dir, institution, "_primary_analysis_results.csv"))
-
+fwrite(primary_results_combined, file = paste0(final_data, institution, "_primary_analysis_results.csv"))
 ```
 
+#STEP 3: SENSITIVITY ANALYSES
 #Sensitivity Analysis #1: RASS Imputation of -1 instead of -5 to start
 ```{r}
-sensitivity_model_one <- lm(percent_deep_sedation_48_sensitivity ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = english_spanish_primary_analysis_filtered)
+sensitivity_model_one <- lm(percent_deep_sedation_48_sensitivity ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
 
 summary(sensitivity_model_one)
 
@@ -297,14 +644,13 @@ sensitivity_model_one_results <- data.frame(
 
 
 # Save the results to a file
-fwrite(sensitivity_model_one_results, file = paste0(output_dir, institution, "_sensitivity_analysis_one.csv"))
+fwrite(sensitivity_model_one_results, file = paste0(final_data, institution, "_sensitivity_analysis_rass_imputation.csv"))
 ```
-
 
 #Sensitivity Analysis #2: First 72 hours of IMV instead of first 48 hours
 ```{r}
-sensitivity_model_two <- lm(percent_deep_sedation_72 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = english_spanish_primary_analysis_filtered)
+sensitivity_model_two <- lm(percent_deep_sedation_72 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
 
 summary(sensitivity_model_two)
 
@@ -318,58 +664,44 @@ sensitivity_model_two_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(sensitivity_model_two_results, file = paste0(output_dir, institution, "_sensitivity_analysis_two.csv"))
+fwrite(sensitivity_model_two_results, file = paste0(final_data, institution, "_sensitivity_analysis_72hr.csv"))
 ```
-
 
 #Sensitivity Analysis #3: Only include patients intubated for full 48-hours to deal with censoring
 ```{r}
-sensitivity_analysis_three_cohort <- english_spanish_primary_analysis_filtered[
-  hours_mechanically_ventilated_72 >= 48
-]
-
-# Identify reference points for model
-sensitivity_analysis_three_cohort$language_cat <- relevel(as.factor(sensitivity_analysis_three_cohort$language_cat), ref = "English")
-sensitivity_analysis_three_cohort$sex_category <- relevel(as.factor(sensitivity_analysis_three_cohort$sex_category), ref = "Male")
-sensitivity_analysis_three_cohort$race_category <- relevel(as.factor(sensitivity_analysis_three_cohort$race_category), ref = "White")
-sensitivity_analysis_three_cohort$ethnicity_category <- relevel(as.factor(sensitivity_analysis_three_cohort$ethnicity_category), ref = "Non-Hispanic/Unknown")
-
-
-sensitivity_model_three <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = sensitivity_analysis_three_cohort)
-
-summary(sensitivity_model_three)
-
-# Extract coefficients, standard errors, variance, and p-values for the adjusted model
-sensitivity_model_three_results <- data.frame(
-  term = names(coef(sensitivity_model_three)),
-  estimate = coef(sensitivity_model_three),
-  std.error = summary(sensitivity_model_three)$coefficients[, "Std. Error"],
-  variance = (summary(sensitivity_model_three)$coefficients[, "Std. Error"])^2,  # Calculate variance
-  p.value = summary(sensitivity_model_three)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+# Step 1: Fit Model with IPW weighting
+sensitivity_model_three <- lm(
+  percent_deep_sedation_48 ~ language_category + race_category + age_category +
+    sex_category + laps2 + elixhauser_score + SVM_SCORE + bmi + factor(hospital_icu_id),
+  data = full_48hr_cohort,
+  weights = ipw
 )
 
+# Step 2: Calculate robust standard errors using sandwich estimator
+robust_se <- vcovHC(sensitivity_model_three, type = "HC3")  # You can change to "HC0" if needed
 
-# Save the results to a file
-fwrite(sensitivity_model_three_results, file = paste0(output_dir, institution, "_sensitivity_analysis_three.csv"))
+# Step 3: Output coefficient table with robust SEs
+sensitivity_model_three_sandwich <- coeftest(sensitivity_model_three, vcov = robust_se)
+print(sensitivity_model_three_sandwich)
+
+# Step 4: Extract results from coeftest matrix
+sensitivity_model_three_results <- data.frame(
+  term = rownames(sensitivity_model_three_sandwich),
+  estimate = sensitivity_model_three_sandwich[, "Estimate"],
+  std.error = sensitivity_model_three_sandwich[, "Std. Error"],
+  variance = sensitivity_model_three_sandwich[, "Std. Error"]^2,
+  p.value = sensitivity_model_three_sandwich[, "Pr(>|t|)"]
+)
+
+# Step 5: Save the results
+fwrite(sensitivity_model_three_results, file = paste0(final_data, institution, "_sensitivity_analysis_full_48hr.csv"))
 ```
 
 
 #Sensitivity Analysis #4: Only include patients with a documented RASS within 2 hours of IMV instead of 8
 ```{r}
-sensitivity_analysis_four_cohort <- english_spanish_primary_analysis_filtered[
-  time_to_first_rass <= 2
-]
-
-# Identify reference points for model
-sensitivity_analysis_four_cohort$language_cat <- relevel(as.factor(sensitivity_analysis_four_cohort$language_cat), ref = "English")
-sensitivity_analysis_four_cohort$sex_category <- relevel(as.factor(sensitivity_analysis_four_cohort$sex_category), ref = "Male")
-sensitivity_analysis_four_cohort$race_category <- relevel(as.factor(sensitivity_analysis_four_cohort$race_category), ref = "White")
-sensitivity_analysis_four_cohort$ethnicity_category <- relevel(as.factor(sensitivity_analysis_four_cohort$ethnicity_category), ref = "Non-Hispanic/Unknown")
-
-
-sensitivity_model_four <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = sensitivity_analysis_four_cohort)
+sensitivity_model_four <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = rass_2hrs_cohort)
 
 summary(sensitivity_model_four)
 
@@ -383,25 +715,14 @@ sensitivity_model_four_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(sensitivity_model_four_results, file = paste0(output_dir, institution, "_sensitivity_analysis_four.csv"))
+fwrite(sensitivity_model_four_results, file = paste0(final_data, institution, "_sensitivity_analysis_rass_2hrs.csv"))
 ```
 
 
 #Sensitivity Analysis #5: Remove Neuro_ICU Patients
 ```{r}
-sensitivity_analysis_five_cohort <- english_spanish_primary_analysis_filtered[
-  !icu_type %in% c("neuro_icu", "neurosurgical_icu", "mixed_neuro_icu")
-]
-
-# Identify reference points for model
-sensitivity_analysis_five_cohort$language_cat <- relevel(as.factor(sensitivity_analysis_five_cohort$language_cat), ref = "English")
-sensitivity_analysis_five_cohort$sex_category <- relevel(as.factor(sensitivity_analysis_five_cohort$sex_category), ref = "Male")
-sensitivity_analysis_five_cohort$race_category <- relevel(as.factor(sensitivity_analysis_five_cohort$race_category), ref = "White")
-sensitivity_analysis_five_cohort$ethnicity_category <- relevel(as.factor(sensitivity_analysis_five_cohort$ethnicity_category), ref = "Non-Hispanic/Unknown")
-
-
-sensitivity_model_five <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = sensitivity_analysis_five_cohort)
+sensitivity_model_five <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = no_neuro_cohort)
 
 summary(sensitivity_model_five)
 
@@ -415,13 +736,13 @@ sensitivity_model_five_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(sensitivity_model_five_results, file = paste0(output_dir, institution, "_sensitivity_analysis_five.csv"))
+fwrite(sensitivity_model_five_results, file = paste0(final_data, institution, "_sensitivity_analysis_no_neuro.csv"))
 ```
 
-#Sensitivity Analysis #6: Remove periods of continuous paralytics
+#Sensitivity Analysis #6: Remove patients who received pushes of paralytics
 ```{r}
-sensitivity_model_six <- lm(percent_deep_sedation_48_unparalyzed ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = english_spanish_primary_analysis_filtered)
+sensitivity_model_six <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = no_push_paralytic_cohort)
 
 summary(sensitivity_model_six)
 
@@ -435,13 +756,12 @@ sensitivity_model_six_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(sensitivity_model_six_results, file = paste0(output_dir, institution, "_sensitivity_analysis_six.csv"))
+fwrite(sensitivity_model_six_results, file = paste0(final_data, institution, "_sensitivity_analysis_no_push_paralytics.csv"))
 ```
-
 
 #Sensitivity Analysis #7: Alternative Definition of Deep Sedation - Weighted Average Rass over first 48_hours
 ```{r}
-sensitivity_model_seven <- glm(deep_sedation_weighted ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id), data = english_spanish_primary_analysis_filtered, 
+sensitivity_model_seven <- glm(deep_sedation_weighted ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2, data = english_spanish_primary_analysis, 
                                   family = binomial(link = "logit"))
 
 summary(sensitivity_model_seven)
@@ -463,42 +783,97 @@ sensitivity_model_seven_results <- data.frame(
 )
 
 # Write the results to a CSV file
-fwrite(sensitivity_model_seven_results, file = paste0(output_dir, institution, "_sensitivity_analysis_seven.csv"))
+fwrite(sensitivity_model_seven_results, file = paste0(final_data, institution, "_sensitivity_analysis_weighted_deep_sedation.csv"))
 ```
 
-#Sensitivity Analysis #8: Hispanic Collinearity
+#Sensitivity Analysis #8: Hispanic Collinearity - Kappa statistic
 ```{r}
-sensitivity_model_eight <- lm(percent_deep_sedation_48 ~ ethnicity_category + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = english_spanish_primary_analysis_filtered)
+# Build contingency table
+tab <- table(english_spanish_primary_analysis$ethnicity_category_final,
+             english_spanish_primary_analysis$language_category)
 
-summary(sensitivity_model_eight)
+# Run kappa
+kappa_site <- psych::cohen.kappa(tab)
 
-# Extract coefficients, standard errors, variance, and p-values for the adjusted model
-sensitivity_model_eight_results <- data.frame(
-  term = names(coef(sensitivity_model_eight)),
-  estimate = coef(sensitivity_model_eight),
-  std.error = summary(sensitivity_model_eight)$coefficients[, "Std. Error"],
-  variance = (summary(sensitivity_model_eight)$coefficients[, "Std. Error"])^2,  # Calculate variance
-  p.value = summary(sensitivity_model_eight)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+# Extract unweighted kappa and z
+kappa_hat <- kappa_site$kappa
+var_kappa <- kappa_site$var.kappa
+se_kappa <- sqrt(kappa_site$var.kappa)
+
+
+kappa_results_primary <- data.table(
+  site = institution,     # change this label as needed
+  kappa_hat = kappa_site$kappa,
+  var_kappa = kappa_site$var.kappa,
+  se_kappa = sqrt(kappa_site$var.kappa)
 )
 
-# Save the results to a file
-fwrite(sensitivity_model_eight_results, file = paste0(output_dir, institution, "_sensitivity_analysis_eight.csv"))
+# Write the results to a CSV file
+fwrite(kappa_results_primary, file = paste0(final_data, institution, "_kappa_results_primary.csv"))
+
+#Sensitivity Analysis
+# Build contingency table
+tab_sensitivity <- table(no_unknown_ethnicity_cohort$ethnicity_category_final,
+             no_unknown_ethnicity_cohort$language_category)
+
+# Run kappa
+kappa_site_sensitivity <- psych::cohen.kappa(tab_sensitivity)
+
+# Extract unweighted kappa and z
+kappa_hat_sensitivity <- kappa_site_sensitivity$kappa
+var_kappa_sensitivity <- kappa_site_sensitivity$var.kappa
+se_kappa_sensitivity <- sqrt(kappa_site_sensitivity$var.kappa)
+
+
+kappa_results_sensitivity <- data.table(
+  site = institution,     # change this label as needed
+  kappa_hat_sensitivity = kappa_site_sensitivity$kappa,
+  var_kappa_sensitivity = kappa_site_sensitivity$var.kappa,
+  se_kappa_sensitivity = sqrt(kappa_site_sensitivity$var.kappa)
+)
+
+# Write the results to a CSV file
+fwrite(kappa_results_sensitivity, file = paste0(final_data, institution, "_kappa_results_sensitivity.csv"))
+
+#Sensitivity Analysis #2
+# Build contingency table
+tab_sensitivity_2 <- table(language_reclass_cohort$ethnicity_category,
+             language_reclass_cohort$language_category)
+
+# Run kappa
+kappa_site_sensitivity_2 <- psych::cohen.kappa(tab_sensitivity_2)
+
+# Extract unweighted kappa and z
+kappa_hat_sensitivity_2 <- kappa_site_sensitivity_2$kappa
+var_kappa_sensitivity_2 <- kappa_site_sensitivity_2$var.kappa
+se_kappa_sensitivity_2 <- sqrt(kappa_site_sensitivity_2$var.kappa)
+
+
+kappa_results_sensitivity_2 <- data.table(
+  site = institution,     # change this label as needed
+  kappa_hat_sensitivity_2 = kappa_site_sensitivity_2$kappa,
+  var_kappa_sensitivity_2 = kappa_site_sensitivity_2$var.kappa,
+  se_kappa_sensitivity_2 = sqrt(kappa_site_sensitivity_2$var.kappa)
+)
+
+# Write the results to a CSV file
+fwrite(kappa_results_sensitivity_2, file = paste0(final_data, institution, "_kappa_results_sensitivity_2.csv"))
+
+#fit <- lm(percent_deep_sedation_48 ~ ethnicity_category + language_category, data = language_reclass_cohort)
+#vif(fit)
+
+library(vcd)
+assocstats(table(no_unknown_ethnicity_cohort$ethnicity_category, no_unknown_ethnicity_cohort$language_category))
+
+eth_lang_table <- table(language_reclass_cohort$ethnicity_category, language_reclass_cohort$language_category)
+fisher.test(eth_lang_table)
 ```
 
 
 #Sensitivity Analysis #9: English vs Non-English
 ```{r}
-raw_analytic_file[, lang_eng := ifelse(language_cat == "English", "English", "Other")]
-
-# Identify reference points for model
-raw_analytic_file$lang_eng <- relevel(as.factor(raw_analytic_file$lang_eng), ref = "English")
-raw_analytic_file$sex_category <- relevel(as.factor(raw_analytic_file$sex_category), ref = "Male")
-raw_analytic_file$race_category <- relevel(as.factor(raw_analytic_file$race_category), ref = "White")
-raw_analytic_file$ethnicity_category <- relevel(as.factor(raw_analytic_file$ethnicity_category), ref = "Non-Hispanic/Unknown")
-
-sensitivity_model_nine <- lm(percent_deep_sedation_48 ~ lang_eng + race_category + age_category + ethnicity_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = raw_analytic_file)
+sensitivity_model_nine <- lm(percent_deep_sedation_48 ~ non_eng + race_category + ethnicity_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = total_cohort)
 
 summary(sensitivity_model_nine)
 
@@ -512,25 +887,14 @@ sensitivity_model_nine_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(sensitivity_model_nine_results, file = paste0(output_dir, institution, "_sensitivity_analysis_nine.csv"))
+fwrite(sensitivity_model_nine_results, file = paste0(final_data, institution, "_sensitivity_analysis_eng_non-eng.csv"))
 
 ```
 
-#Sensitivity Analysis #10: Completely Remove Patients with any Continuous Paralytics
+#Sensitivity Analysis #10: Completely Remove Patients with any Paralytics
 ```{r}
-sensitivity_analysis_ten_cohort <- english_spanish_primary_analysis_filtered[
-  time_to_first_paralytic >= 48 | is.na(time_to_first_paralytic)
-]
-
-# Identify reference points for model
-sensitivity_analysis_ten_cohort$language_cat <- relevel(as.factor(sensitivity_analysis_ten_cohort$language_cat), ref = "English")
-sensitivity_analysis_ten_cohort$sex_category <- relevel(as.factor(sensitivity_analysis_ten_cohort$sex_category), ref = "Male")
-sensitivity_analysis_ten_cohort$race_category <- relevel(as.factor(sensitivity_analysis_ten_cohort$race_category), ref = "White")
-sensitivity_analysis_ten_cohort$ethnicity_category <- relevel(as.factor(sensitivity_analysis_ten_cohort$ethnicity_category), ref = "Non-Hispanic/Unknown")
-
-
-sensitivity_model_ten <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = sensitivity_analysis_ten_cohort)
+sensitivity_model_ten <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = no_paralytic_cohort)
 
 summary(sensitivity_model_ten)
 
@@ -544,14 +908,216 @@ sensitivity_model_ten_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(sensitivity_model_ten_results, file = paste0(output_dir, institution, "_sensitivity_analysis_ten.csv"))
+fwrite(sensitivity_model_ten_results, file = paste0(final_data, institution, "_sensitivity_analysis_no_paralysis.csv"))
+```
+
+#Sensitivity Analysis #11: Non-English, Non-Spanish Sensitivity
+```{r}
+sensitivity_model_eleven <- lm(percent_deep_sedation_48 ~ top_five_non_eng_non_spanish + race_category + ethnicity_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = top_five_cohort)
+
+summary(sensitivity_model_eleven)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+sensitivity_model_eleven_results <- data.frame(
+  term = names(coef(sensitivity_model_eleven)),
+  estimate = coef(sensitivity_model_eleven),
+  std.error = summary(sensitivity_model_eleven)$coefficients[, "Std. Error"],
+  variance = (summary(sensitivity_model_eleven)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(sensitivity_model_eleven)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(sensitivity_model_eleven_results, file = paste0(final_data, institution, "_sensitivity_analysis_top_five.csv"))
+```
+
+#Sensitivity Analysis #12: English, Spanish, All ICUs
+```{r}
+sensitivity_model_twelve <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_all_icu_analysis)
+
+summary(sensitivity_model_twelve)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+sensitivity_model_twelve_results <- data.frame(
+  term = names(coef(sensitivity_model_twelve)),
+  estimate = coef(sensitivity_model_twelve),
+  std.error = summary(sensitivity_model_twelve)$coefficients[, "Std. Error"],
+  variance = (summary(sensitivity_model_twelve)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(sensitivity_model_twelve)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(sensitivity_model_twelve_results, file = paste0(final_data, institution, "_sensitivity_analysis_all_icus.csv"))
+```
+
+#Sensitivity Analysis #13: Total Hours Deep Sedation
+```{r}
+sensitivity_model_thirteen <- lm(deep_sedation_count_total_48 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
+
+summary(sensitivity_model_thirteen)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+sensitivity_model_thirteen_results <- data.frame(
+  term = names(coef(sensitivity_model_thirteen)),
+  estimate = coef(sensitivity_model_thirteen),
+  std.error = summary(sensitivity_model_thirteen)$coefficients[, "Std. Error"],
+  variance = (summary(sensitivity_model_thirteen)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(sensitivity_model_thirteen)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(sensitivity_model_thirteen_results, file = paste0(final_data, institution, "_sensitivity_analysis_total_hours_deep_sedation.csv"))
 ```
 
 
+#Sensitivity Analysis #14: Inclusion of ethnicity_category
+```{r}
+sensitivity_model_fourteen <- lm(percent_deep_sedation_48 ~ language_category + ethnicity_category_final + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
+
+summary(sensitivity_model_fourteen)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+sensitivity_model_fourteen_results <- data.frame(
+  term = names(coef(sensitivity_model_fourteen)),
+  estimate = coef(sensitivity_model_fourteen),
+  std.error = summary(sensitivity_model_fourteen)$coefficients[, "Std. Error"],
+  variance = (summary(sensitivity_model_fourteen)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(sensitivity_model_fourteen)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(sensitivity_model_fourteen_results, file = paste0(final_data, institution, "_sensitivity_analysis_ethnicity_inclusion.csv"))
+```
+
+#Sensitivity Analysis #15: Include ethnicity_category with ethnicity_category re-classified per preferred language
+```{r}
+sensitivity_model_fifteen <- lm(percent_deep_sedation_48 ~ language_category + ethnicity_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = language_reclass_cohort)
+
+summary(sensitivity_model_fifteen)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+sensitivity_model_fifteen_results <- data.frame(
+  term = names(coef(sensitivity_model_fifteen)),
+  estimate = coef(sensitivity_model_fifteen),
+  std.error = summary(sensitivity_model_fifteen)$coefficients[, "Std. Error"],
+  variance = (summary(sensitivity_model_fifteen)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(sensitivity_model_fifteen)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(sensitivity_model_fifteen_results, file = paste0(final_data, institution, "_sensitivity_analysis_ethnicity_reclassification.csv"))
+```
+
+#Sensitivity Analysis #16: Exclude Unknown Ethnicity Patients
+```{r}
+sensitivity_model_sixteen <- lm(percent_deep_sedation_48 ~ language_category + ethnicity_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = no_unknown_ethnicity_cohort)
+
+summary(sensitivity_model_sixteen)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+sensitivity_model_sixteen_results <- data.frame(
+  term = names(coef(sensitivity_model_sixteen)),
+  estimate = coef(sensitivity_model_sixteen),
+  std.error = summary(sensitivity_model_sixteen)$coefficients[, "Std. Error"],
+  variance = (summary(sensitivity_model_sixteen)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(sensitivity_model_sixteen)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(sensitivity_model_sixteen_results, file = paste0(final_data, institution, "_sensitivity_analysis_no_unknown_ethnicity.csv"))
+```
+
+#Sensitivity Analysis #17: Only Paralytic Patients
+```{r}
+sensitivity_model_seventeen <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = only_paralytic_cohort)
+
+summary(sensitivity_model_seventeen)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+sensitivity_model_seventeen_results <- data.frame(
+  term = names(coef(sensitivity_model_seventeen)),
+  estimate = coef(sensitivity_model_seventeen),
+  std.error = summary(sensitivity_model_seventeen)$coefficients[, "Std. Error"],
+  variance = (summary(sensitivity_model_seventeen)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(sensitivity_model_seventeen)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(sensitivity_model_seventeen_results, file = paste0(final_data, institution, "_sensitivity_analysis_only_paralytic_patients.csv"))
+```
+
+#Sensitivity Analysis #18: Non-English, No Paralytic Patients
+```{r}
+sensitivity_model_eighteen <- lm(percent_deep_sedation_48 ~ non_eng + ethnicity_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = non_english_no_paralytic_cohort)
+
+summary(sensitivity_model_eighteen)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+sensitivity_model_eighteen_results <- data.frame(
+  term = names(coef(sensitivity_model_eighteen)),
+  estimate = coef(sensitivity_model_eighteen),
+  std.error = summary(sensitivity_model_eighteen)$coefficients[, "Std. Error"],
+  variance = (summary(sensitivity_model_eighteen)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(sensitivity_model_eighteen)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(sensitivity_model_eighteen_results, file = paste0(final_data, institution, "_sensitivity_analysis_non_english_no_paralytic_patients.csv"))
+```
+
+#Sensitivity Analysis #19: No Continuous Paralytics
+```{r}
+sensitivity_model_nineteen <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = no_continuous_paralytic_cohort)
+
+summary(sensitivity_model_nineteen)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+sensitivity_model_nineteen_results <- data.frame(
+  term = names(coef(sensitivity_model_nineteen)),
+  estimate = coef(sensitivity_model_nineteen),
+  std.error = summary(sensitivity_model_nineteen)$coefficients[, "Std. Error"],
+  variance = (summary(sensitivity_model_nineteen)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(sensitivity_model_nineteen)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(sensitivity_model_nineteen_results, file = paste0(final_data, institution, "_sensitivity_analysis_no_continuous_paralytic_patients.csv"))
+```
+
+#Sensitivity Analysis #20: Controlling for Paralytics
+```{r}
+sensitivity_model_twenty <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2 + paralytic_early_flag,
+               data = english_spanish_primary_analysis)
+
+summary(sensitivity_model_twenty)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+sensitivity_model_twenty_results <- data.frame(
+  term = names(coef(sensitivity_model_twenty)),
+  estimate = coef(sensitivity_model_twenty),
+  std.error = summary(sensitivity_model_twenty)$coefficients[, "Std. Error"],
+  variance = (summary(sensitivity_model_twenty)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(sensitivity_model_twenty)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(sensitivity_model_twenty_results, file = paste0(final_data, institution, "_sensitivity_analysis_controlling_for_paralytics.csv"))
+```
+
+
+#STEP FOUR: SECONDARY ANALYSES
 #Secondary Analysis #1: Total time mechnically ventilated
 ```{r}
-secondary_model_imv_time <- lm(imv_duration_hours_final ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = english_spanish_primary_analysis_filtered)
+secondary_model_imv_time <- lm(imv_duration_hours_final ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
 
 summary(secondary_model_imv_time)
 
@@ -565,14 +1131,14 @@ secondary_model_imv_time_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(secondary_model_imv_time_results, file = paste0(output_dir, institution, "_secondary_analysis_imv_time.csv"))
+fwrite(secondary_model_imv_time_results, file = paste0(final_data, institution, "_secondary_analysis_imv_time.csv"))
 
 ```
 
 #Secondary Analysis #2: 28-Day Ventilator-Free-Days
 ```{r}
-secondary_model_vfd <- lm(vfd_clean ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = english_spanish_primary_analysis_filtered)
+secondary_model_vfd <- lm(vfd_clean ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
 
 summary(secondary_model_vfd)
 
@@ -586,35 +1152,36 @@ secondary_model_vfd_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(secondary_model_vfd_results, file = paste0(output_dir, institution, "_secondary_analysis_vfd.csv"))
+fwrite(secondary_model_vfd_results, file = paste0(final_data, institution, "_secondary_analysis_vfd.csv"))
 
 ```
 
 
-#Secondary Analysis #3: Time to First SBT
+#Secondary Analysis #3: 28 Day ICU Free Days
 ```{r}
-secondary_model_sbt <- lm(time_to_successful_sbt ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = english_spanish_primary_analysis_filtered)
+secondary_model_icufd <- lm(icufd_28 ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
 
-summary(secondary_model_sbt)
+summary(secondary_model_icufd)
 
 # Extract coefficients, standard errors, variance, and p-values for the adjusted model
-secondary_model_sbt <- data.frame(
-  term = names(coef(secondary_model_sbt)),
-  estimate = coef(secondary_model_sbt),
-  std.error = summary(secondary_model_sbt)$coefficients[, "Std. Error"],
-  variance = (summary(secondary_model_sbt)$coefficients[, "Std. Error"])^2,  # Calculate variance
-  p.value = summary(secondary_model_sbt)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+secondary_model_icufd_results <- data.frame(
+  term = names(coef(secondary_model_icufd)),
+  estimate = coef(secondary_model_icufd),
+  std.error = summary(secondary_model_icufd)$coefficients[, "Std. Error"],
+  variance = (summary(secondary_model_icufd)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(secondary_model_icufd)$coefficients[, "Pr(>|t|)"]  # Extract p-values
 )
 
 # Save the results to a file
-fwrite(secondary_model_sbt, file = paste0(output_dir, institution, "_secondary_analysis_sbt.csv"))
+fwrite(secondary_model_icufd_results, file = paste0(final_data, institution, "_secondary_analysis_icufd.csv"))
+
 ```
 
 
 #Secondary Analysis #4: 30-Day Mortality
 ```{r}
-secondary_model_30day_mortality <- glm(thirty_day_mortality ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id), data = english_spanish_primary_analysis_filtered, 
+secondary_model_30day_mortality <- glm(thirty_day_mortality ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2, data = english_spanish_primary_analysis, 
                                   family = binomial(link = "logit"))
 
 summary(secondary_model_30day_mortality)
@@ -636,14 +1203,14 @@ secondary_model_30day_mortality_results <- data.frame(
 )
 
 # Write the results to a CSV file
-fwrite(secondary_model_30day_mortality_results, file = paste0(output_dir, institution, "_secondary_analysis_thirty_day_mortality.csv"))
+fwrite(secondary_model_30day_mortality_results, file = paste0(final_data, institution, "_secondary_analysis_thirty_day_mortality.csv"))
 
 ```
 
 
 #Secondary Analysis #5: Tracheostomy Incidence
 ```{r}
-secondary_model_trach <- glm(trached ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id), data = english_spanish_primary_analysis_filtered, 
+secondary_model_trach <- glm(trached ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2, data = english_spanish_primary_analysis, 
                                   family = binomial(link = "logit"))
 
 summary(secondary_model_trach)
@@ -665,14 +1232,13 @@ secondary_model_trach_results <- data.frame(
 )
 
 # Write the results to a CSV file
-fwrite(secondary_model_trach_results, file = paste0(output_dir, institution, "_secondary_analysis_trach.csv"))
+fwrite(secondary_model_trach_results, file = paste0(final_data, institution, "_secondary_analysis_trach.csv"))
 
 ```
 
-
 #Secondary Analysis #6: Reintubation Incidence
 ```{r}
-secondary_model_reintubation <- glm(reintubation ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id), data = english_spanish_primary_analysis_filtered, 
+secondary_model_reintubation <- glm(reintubation ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2, data = english_spanish_primary_analysis, 
                                   family = binomial(link = "logit"))
 
 summary(secondary_model_reintubation)
@@ -694,17 +1260,13 @@ secondary_model_reintubation_results <- data.frame(
 )
 
 # Write the results to a CSV file
-fwrite(secondary_model_reintubation_results, file = paste0(output_dir, institution, "_secondary_analysis_reintubation.csv"))
+fwrite(secondary_model_reintubation_results, file = paste0(final_data, institution, "_secondary_analysis_reintubation.csv"))
 
 ```
 
-
-#Secondary Analysis #7: Odds of Paralysis
+#Secondary Analysis #7: Odds of Any Paralysis
 ```{r}
-english_spanish_primary_analysis_filtered[, paralytic_early_flag := ifelse(time_to_first_paralytic >= 0 & time_to_first_paralytic <= 48, 1, 0)]
-setnafill(english_spanish_primary_analysis_filtered, cols = "paralytic_early_flag", fill = 0)
-
-secondary_model_paralysis <- glm(paralytic_early_flag ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id), data = english_spanish_primary_analysis_filtered, 
+secondary_model_paralysis <- glm(paralytic_early_flag ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2 + covid_status, data = english_spanish_primary_analysis, 
                                   family = binomial(link = "logit"))
 
 summary(secondary_model_paralysis)
@@ -726,13 +1288,13 @@ secondary_model_paralysis_results <- data.frame(
 )
 
 # Write the results to a CSV file
-fwrite(secondary_model_paralysis_results, file = paste0(output_dir, institution, "_secondary_analysis_paralysis.csv"))
+fwrite(secondary_model_paralysis_results, file = paste0(final_data, institution, "_secondary_analysis_paralysis.csv"))
 ```
 
 #Secondary Analysis #8: 6-month hospital free days
 ```{r}
-secondary_model_hfd_6m <- lm(hfd_6m ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
-               data = english_spanish_primary_analysis_filtered)
+secondary_model_hfd_6m <- lm(hfd_6m ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
 
 summary(secondary_model_hfd_6m)
 
@@ -746,23 +1308,206 @@ secondary_model_hfd_6m_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(secondary_model_hfd_6m_results, file = paste0(output_dir, institution, "_secondary_analysis_hfd_6m.csv"))
+fwrite(secondary_model_hfd_6m_results, file = paste0(final_data, institution, "_secondary_analysis_hfd_6m.csv"))
+```
+
+#Secondary Analysis #9: 28-day Hospital free days
+```{r}
+secondary_model_hfd_28d <- lm(hfd_28d ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
+
+summary(secondary_model_hfd_28d)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+secondary_model_hfd_28d_results <- data.frame(
+  term = names(coef(secondary_model_hfd_28d)),
+  estimate = coef(secondary_model_hfd_28d),
+  std.error = summary(secondary_model_hfd_28d)$coefficients[, "Std. Error"],
+  variance = (summary(secondary_model_hfd_28d)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(secondary_model_hfd_28d)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(secondary_model_hfd_28d_results, file = paste0(final_data, institution, "_secondary_analysis_hfd_28d.csv"))
 
 ```
 
+#Secondary Analysis #10: Odds of Push Paralytics
+```{r}
+secondary_model_push_paralytics <- glm(push_paralytics ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2 + covid_status, data = english_spanish_primary_analysis, 
+                                  family = binomial(link = "logit"))
 
+summary(secondary_model_push_paralytics)
+
+# Extract coefficients and calculate odds ratios, standard errors, and variance
+coef_summary_push_paralytics <- summary(secondary_model_push_paralytics)$coefficients
+odds_ratios <- exp(coef_summary_push_paralytics[, "Estimate"])  # Exponentiated coefficients
+standard_errors <- coef_summary_push_paralytics[, "Std. Error"]
+variance <- standard_errors^2  # Calculate variance
+p_values <- coef_summary_push_paralytics[, "Pr(>|z|)"]  # Extract p-values
+
+# Create a data frame to hold the results
+secondary_model_push_paralytics_results <- data.frame(
+    Variable = rownames(coef_summary_push_paralytics),
+    Odds_Ratio = odds_ratios,
+    Std_Error = standard_errors,
+    Variance = variance,  # Add variance
+    P_Value = p_values    # Add p-values
+)
+
+# Write the results to a CSV file
+fwrite(secondary_model_push_paralytics_results, file = paste0(final_data, institution, "_secondary_analysis_push_paralytics.csv"))
+```
+
+#Secondary Analysis #11: Odds of Continuous Paralysis
+```{r}
+secondary_model_paralysis_cont <- glm(paralysis_cont ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2 + covid_status, data = english_spanish_primary_analysis, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_paralysis_cont)
+
+# Extract coefficients and calculate odds ratios, standard errors, and variance
+coef_summary_paralysis_cont <- summary(secondary_model_paralysis_cont)$coefficients
+odds_ratios <- exp(coef_summary_paralysis_cont[, "Estimate"])  # Exponentiated coefficients
+standard_errors <- coef_summary_paralysis_cont[, "Std. Error"]
+variance <- standard_errors^2  # Calculate variance
+p_values <- coef_summary_paralysis_cont[, "Pr(>|z|)"]  # Extract p-values
+
+# Create a data frame to hold the results
+secondary_model_paralysis_cont_results <- data.frame(
+    Variable = rownames(coef_summary_paralysis_cont),
+    Odds_Ratio = odds_ratios,
+    Std_Error = standard_errors,
+    Variance = variance,  # Add variance
+    P_Value = p_values    # Add p-values
+)
+
+# Write the results to a CSV file
+fwrite(secondary_model_paralysis_cont_results, file = paste0(final_data, institution, "_secondary_analysis_paralysis_cont.csv"))
+```
+
+#Secondary Analysis #11: MME
+```{r}
+secondary_model_mme <- lm(mme_median ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
+
+summary(secondary_model_mme)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+secondary_model_mme_results <- data.frame(
+  term = names(coef(secondary_model_mme)),
+  estimate = coef(secondary_model_mme),
+  std.error = summary(secondary_model_mme)$coefficients[, "Std. Error"],
+  variance = (summary(secondary_model_mme)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(secondary_model_mme)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(secondary_model_mme_results, file = paste0(final_data, institution, "_secondary_analysis_mme.csv"))
+```
+
+#Secondary Analysis #12: Benzos
+```{r}
+secondary_model_benzos <- lm(loraz_median ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
+
+summary(secondary_model_benzos)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+secondary_model_benzos_results <- data.frame(
+  term = names(coef(secondary_model_benzos)),
+  estimate = coef(secondary_model_benzos),
+  std.error = summary(secondary_model_benzos)$coefficients[, "Std. Error"],
+  variance = (summary(secondary_model_benzos)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(secondary_model_benzos)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(secondary_model_benzos_results, file = paste0(final_data, institution, "_secondary_analysis_benzos.csv"))
+```
+
+#Secondary Analysis #13: Propofol
+```{r}
+secondary_model_propofol <- lm(propofol_median ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = english_spanish_primary_analysis)
+
+summary(secondary_model_propofol)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+secondary_model_propofol_results <- data.frame(
+  term = names(coef(secondary_model_propofol)),
+  estimate = coef(secondary_model_propofol),
+  std.error = summary(secondary_model_propofol)$coefficients[, "Std. Error"],
+  variance = (summary(secondary_model_propofol)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(secondary_model_propofol)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(secondary_model_propofol_results, file = paste0(final_data, institution, "_secondary_analysis_propofol.csv"))
+```
+
+#Secondary Analysis #14: Odds of Being Started on Benzos
+```{r}
+english_spanish_primary_analysis[, benzos := fifelse(!is.na(loraz_median), 1, 0)]
+
+secondary_model_benzo_odds <- glm(benzos ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2, data = english_spanish_primary_analysis, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_benzo_odds)
+
+# Extract coefficients and calculate odds ratios, standard errors, and variance
+coef_summary_benzo_odds <- summary(secondary_model_benzo_odds)$coefficients
+odds_ratios <- exp(coef_summary_benzo_odds[, "Estimate"])  # Exponentiated coefficients
+standard_errors <- coef_summary_benzo_odds[, "Std. Error"]
+variance <- standard_errors^2  # Calculate variance
+p_values <- coef_summary_benzo_odds[, "Pr(>|z|)"]  # Extract p-values
+
+# Create a data frame to hold the results
+secondary_model_benzo_odds_results <- data.frame(
+    Variable = rownames(coef_summary_benzo_odds),
+    Odds_Ratio = odds_ratios,
+    Std_Error = standard_errors,
+    Variance = variance,  # Add variance
+    P_Value = p_values    # Add p-values
+)
+
+# Write the results to a CSV file
+fwrite(secondary_model_benzo_odds_results, file = paste0(final_data, institution, "_secondary_analysis_benzo_odds.csv"))
+
+```
+
+#Secondary Analysis #15: Opioid Only Analgesia
+```{r}
+secondary_model_opioid_only_analgesia <- glm(opioid_only_analgesia ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2, data = english_spanish_primary_analysis, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_opioid_only_analgesia)
+
+# Extract coefficients and calculate odds ratios, standard errors, and variance
+coef_summary_opioid_only_cont <- summary(secondary_model_opioid_only_analgesia)$coefficients
+odds_ratios <- exp(coef_summary_opioid_only_cont[, "Estimate"])  # Exponentiated coefficients
+standard_errors <- coef_summary_opioid_only_cont[, "Std. Error"]
+variance <- standard_errors^2  # Calculate variance
+p_values <- coef_summary_opioid_only_cont[, "Pr(>|z|)"]  # Extract p-values
+
+# Create a data frame to hold the results
+secondary_model_opioid_only_results <- data.frame(
+    Variable = rownames(coef_summary_opioid_only_cont),
+    Odds_Ratio = odds_ratios,
+    Std_Error = standard_errors,
+    Variance = variance,  # Add variance
+    P_Value = p_values    # Add p-values
+)
+
+# Write the results to a CSV file
+fwrite(secondary_model_opioid_only_results, file = paste0(final_data, institution, "_secondary_analysis_opioid_only.csv"))
+```
+
+
+#STEP FIVE: SUBGROUP ANALYSES
 #Subgroup Analysis #1: Hispanic Patients
 ```{r}
-hispanic_cohort <- english_spanish_primary_analysis_filtered[ethnicity_category == "Hispanic"]
-
-# Identify reference points for model
-hispanic_cohort$language_cat <- relevel(as.factor(hispanic_cohort$language_cat), ref = "English")
-hispanic_cohort$sex_category <- relevel(as.factor(hispanic_cohort$sex_category), ref = "Male")
-hispanic_cohort$race_category <- relevel(as.factor(hispanic_cohort$race_category), ref = "White")
-#hispanic_cohort$ethnicity_category <- relevel(as.factor(hispanic_cohort$ethnicity_category), ref = "Non-Hispanic/Unknown")
-
-
-subgroup_model_hispanic <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
+subgroup_model_hispanic <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
                data = hispanic_cohort)
 
 summary(subgroup_model_hispanic)
@@ -777,29 +1522,21 @@ subgroup_model_hispanic_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(subgroup_model_hispanic_results, file = paste0(output_dir, institution, "_subgroup_analysis_hispanic.csv"))
+fwrite(subgroup_model_hispanic_results, file = paste0(final_data, institution, "_subgroup_analysis_hispanic.csv"))
 ```
 
 
 #Subgroup Analysis #2: MICU Patients
 ```{r}
-micu_only_cohort <- english_spanish_primary_analysis_filtered[icu_type == "Medical ICU"]
-
-# Identify reference points for model
-micu_only_cohort$language_cat <- relevel(as.factor(micu_only_cohort$language_cat), ref = "English")
-micu_only_cohort$sex_category <- relevel(as.factor(micu_only_cohort$sex_category), ref = "Male")
-micu_only_cohort$race_category <- relevel(as.factor(micu_only_cohort$race_category), ref = "White")
-micu_only_cohort$ethnicity_category <- relevel(as.factor(micu_only_cohort$ethnicity_category), ref = "Non-Hispanic/Unknown")
-
 
 if(n_distinct(micu_only_cohort$hospital_icu_id) > 1) {
   
-subgroup_model_micu <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi + factor(hospital_icu_id),
+subgroup_model_micu <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
                data = micu_only_cohort)
   
 } else {
 
-subgroup_model_micu <- lm(percent_deep_sedation_48 ~ language_cat + race_category + age_category + sex_category + total_sofa + bmi,
+subgroup_model_micu <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + bmi + sex_category + elixhauser_score + SVM_SCORE + laps2,
                data = micu_only_cohort)
   
 }
@@ -816,7 +1553,70 @@ subgroup_model_micu_results <- data.frame(
 )
 
 # Save the results to a file
-fwrite(subgroup_model_micu_results, file = paste0(output_dir, institution, "_subgroup_analysis_micu.csv"))
+fwrite(subgroup_model_micu_results, file = paste0(final_data, institution, "_subgroup_analysis_micu.csv"))
+
+```
+
+
+#Subgroup Analysis #3: COVID Pandemic Onwards Cohort
+```{r}
+subgroup_model_pandemic <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2 + covid_status,
+               data = pandemic_cohort)
+
+summary(subgroup_model_pandemic)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+subgroup_model_pandemic_results <- data.frame(
+  term = names(coef(subgroup_model_pandemic)),
+  estimate = coef(subgroup_model_pandemic),
+  std.error = summary(subgroup_model_pandemic)$coefficients[, "Std. Error"],
+  variance = (summary(subgroup_model_pandemic)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(subgroup_model_pandemic)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(subgroup_model_pandemic_results, file = paste0(final_data, institution, "_subgroup_analysis_pandemic.csv"))
+
+```
+
+#Subgroup Analysis #4: Non-Hispanic Patients
+```{r}
+subgroup_model_non_hispanic <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = non_hispanic_cohort)
+
+summary(subgroup_model_non_hispanic)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+subgroup_model_non_hispanic_results <- data.frame(
+  term = names(coef(subgroup_model_non_hispanic)),
+  estimate = coef(subgroup_model_non_hispanic),
+  std.error = summary(subgroup_model_non_hispanic)$coefficients[, "Std. Error"],
+  variance = (summary(subgroup_model_non_hispanic)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(subgroup_model_non_hispanic)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(subgroup_model_non_hispanic_results, file = paste0(final_data, institution, "_subgroup_analysis_non_hispanic.csv"))
+```
+
+#Subgroup Analysis #5: Pre Pandemic Cohort
+```{r}
+subgroup_model_pre_pandemic <- lm(percent_deep_sedation_48 ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+               data = pre_pandemic_cohort)
+
+summary(subgroup_model_pre_pandemic)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+subgroup_model_pre_pandemic_results <- data.frame(
+  term = names(coef(subgroup_model_pre_pandemic)),
+  estimate = coef(subgroup_model_pre_pandemic),
+  std.error = summary(subgroup_model_pre_pandemic)$coefficients[, "Std. Error"],
+  variance = (summary(subgroup_model_pre_pandemic)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(subgroup_model_pre_pandemic)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(subgroup_model_pre_pandemic_results, file = paste0(final_data, institution, "_subgroup_analysis_pre_pandemic.csv"))
 
 ```
 
@@ -825,35 +1625,17 @@ fwrite(subgroup_model_micu_results, file = paste0(output_dir, institution, "_sub
 data_cleaning_summary_analysis <- data.table(
   Stage = c(
     "Patients Removed for Speaking Language Other than English or Spanish", 
-    "Patients Removed Because ICU never had Spanish speaking patient",
-    "Patients Intubated for Full 48 Hours",
-    "Patients With RASS within 2 hours",
-    "Cohort without Neuro ICU Patients",
-    "Cohort without Continuous Paralytics",
-    "Hispanic Cohort",
-    "MICU Cohort"
+    "Patients Removed Because ICU never had Spanish speaking patient"
  ),
   Table_Name = c(
-    "raw_analytic_file - english_spanish_primary_analysis", 
-    "english_spanish_primary_analysis - english_spanish_primary_analysis_filtered",
-    "sensitivity_analysis_three_cohort",
-    "sensitivity_analysis_four_cohort",
-    "sensitivity_analysis_five_cohort",
-    "sensitivity_analysis_ten_cohort",
-    "hispanic_cohort",
-    "micu_only_cohort"
+    "total_cohort - english_spanish_primary_all_icu_analysis", 
+    "english_spanish_primary_all_icu_analysis - english_spanish_primary_analysis"
 ),
   Row_Count = c(
-    nrow(raw_analytic_file) - nrow(english_spanish_primary_analysis), 
-    nrow(english_spanish_primary_analysis) - nrow(english_spanish_primary_analysis_filtered),
-    nrow(sensitivity_analysis_three_cohort),
-    nrow(sensitivity_analysis_four_cohort),
-    nrow(sensitivity_analysis_five_cohort),
-    nrow(sensitivity_analysis_ten_cohort),
-    nrow(hispanic_cohort),
-    nrow(micu_only_cohort)
+    nrow(total_cohort) - nrow(english_spanish_all_icu_analysis), 
+    nrow(english_spanish_all_icu_analysis) - nrow(english_spanish_primary_analysis)
   )
 )
 
-fwrite(data_cleaning_summary_analysis, file = paste0(output_dir, institution, "_analysis_data_cleaning_summary.csv"))
+fwrite(data_cleaning_summary_analysis, file = paste0(final_data, institution, "_analysis_data_cleaning_summary.csv"))
 ```
