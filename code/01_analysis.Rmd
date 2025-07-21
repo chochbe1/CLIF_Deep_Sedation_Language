@@ -267,6 +267,7 @@ english_spanish_primary_analysis[, paralysis_cont := fifelse(
   1, 0)]
 setnafill(english_spanish_primary_analysis, cols = "paralysis_cont", fill = 0)
 
+english_spanish_primary_analysis[, benzos := fifelse(!is.na(loraz_median), 1, 0)]
 ```
 
 #Cohort Intubated for Full 48 Hours
@@ -858,21 +859,12 @@ kappa_results_sensitivity_2 <- data.table(
 
 # Write the results to a CSV file
 fwrite(kappa_results_sensitivity_2, file = paste0(final_data, institution, "_kappa_results_sensitivity_2.csv"))
-
-#fit <- lm(percent_deep_sedation_48 ~ ethnicity_category + language_category, data = language_reclass_cohort)
-#vif(fit)
-
-#library(vcd)
-#assocstats(table(no_unknown_ethnicity_cohort$ethnicity_category, no_unknown_ethnicity_cohort$language_category))
-
-#eth_lang_table <- table(language_reclass_cohort$ethnicity_category, language_reclass_cohort$language_category)
-#fisher.test(eth_lang_table)
 ```
 
 
 #Sensitivity Analysis #9: English vs Non-English
 ```{r}
-sensitivity_model_nine <- lm(percent_deep_sedation_48 ~ non_eng + race_category + ethnicity_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+sensitivity_model_nine <- lm(percent_deep_sedation_48 ~ non_eng + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
                data = total_cohort)
 
 summary(sensitivity_model_nine)
@@ -1054,7 +1046,7 @@ fwrite(sensitivity_model_seventeen_results, file = paste0(final_data, institutio
 
 #Sensitivity Analysis #18: Non-English, No Paralytic Patients
 ```{r}
-sensitivity_model_eighteen <- lm(percent_deep_sedation_48 ~ non_eng + ethnicity_category + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
+sensitivity_model_eighteen <- lm(percent_deep_sedation_48 ~ non_eng + race_category + age_category + sex_category + bmi + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2,
                data = non_english_no_paralytic_cohort)
 
 summary(sensitivity_model_eighteen)
@@ -1448,8 +1440,6 @@ fwrite(secondary_model_propofol_results, file = paste0(final_data, institution, 
 
 #Secondary Analysis #14: Odds of Being Started on Benzos
 ```{r}
-english_spanish_primary_analysis[, benzos := fifelse(!is.na(loraz_median), 1, 0)]
-
 secondary_model_benzo_odds <- glm(benzos ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2, data = english_spanish_primary_analysis, 
                                   family = binomial(link = "logit"))
 
@@ -1473,7 +1463,6 @@ secondary_model_benzo_odds_results <- data.frame(
 
 # Write the results to a CSV file
 fwrite(secondary_model_benzo_odds_results, file = paste0(final_data, institution, "_secondary_analysis_benzo_odds.csv"))
-
 ```
 
 #Secondary Analysis #15: Opioid Only Analgesia
