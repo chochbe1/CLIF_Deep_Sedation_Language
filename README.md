@@ -41,8 +41,8 @@ Please refer to the online CLIF data dictionary, ETL tools, and specific table c
 Adults with documented IMV periods >24 hours. There are no date constraints.
 
 ## Expected Results - Please upload the following to Box
-* final_data folder - 40 total files - 2 data cleaning summaries, 2 LAPS2 missing summaries, 1 language count, 1 histogram, 1 primary analysis, 2 kappa tables, 18 sensitivity analyses, 9 secondary analyses, 4 subgroup analyses
-* final_tables folder - 17 total files
+* final_data folder - 49 total files - 2 data cleaning summaries, 2 LAPS2 missing summaries, 1 language count, 1 histogram, 1 primary analysis, 2 kappa tables, 20 sensitivity analyses, 15 secondary analyses, 5 subgroup analyses
+* final_tables folder - 19 total files
 * secondary_project folder - 63 files
 
 ## Detailed Instructions
