@@ -165,7 +165,7 @@ english_spanish_all_icu_analysis$ethnicity_category <- relevel(as.factor(english
 
 #Basic Table One
 # Generate the summary table grouped by language
-eng_span_all_icu_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = english_spanish_all_icu_analysis, factorVars = catVars, test = TRUE)
+eng_span_all_icu_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | language_category, data = english_spanish_all_icu_analysis, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
 save_html(as.tags(eng_span_all_icu_table_one), file = paste0(tables_dir, institution, "_eng_span_all_icu_cohort_table_one_manuscript.html"))
@@ -283,7 +283,7 @@ full_48hr_cohort$ethnicity_category <- relevel(as.factor(full_48hr_cohort$ethnic
 
 #Basic Table One
 # Generate the summary table grouped by language
-full_48hr_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = full_48hr_cohort, factorVars = catVars, test = TRUE)
+full_48hr_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | language_category, data = full_48hr_cohort, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
 save_html(as.tags(full_48hr_table_one), file = paste0(tables_dir, institution, "_full_48hr_cohort_table_one_manuscript.html"))
@@ -301,7 +301,7 @@ rass_2hrs_cohort$ethnicity_category <- relevel(as.factor(rass_2hrs_cohort$ethnic
 
 #Basic Table One
 # Generate the summary table grouped by language
-rass_2hrs_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = rass_2hrs_cohort, factorVars = catVars, test = TRUE)
+rass_2hrs_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | language_category, data = rass_2hrs_cohort, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
 save_html(as.tags(rass_2hrs_table_one), file = paste0(tables_dir, institution, "_rass_2hrs_cohort_table_one_manuscript.html"))
@@ -321,7 +321,7 @@ no_neuro_cohort$ethnicity_category <- relevel(as.factor(no_neuro_cohort$ethnicit
 
 #Basic Table One
 # Generate the summary table grouped by language
-no_neuro_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = no_neuro_cohort, factorVars = catVars, test = TRUE)
+no_neuro_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | language_category, data = no_neuro_cohort, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
 save_html(as.tags(no_neuro_table_one), file = paste0(tables_dir, institution, "_no_neuro_cohort_table_one_manuscript.html"))
@@ -342,7 +342,7 @@ no_paralytic_cohort$ethnicity_category <- relevel(as.factor(no_paralytic_cohort$
 
 #Basic Table One
 # Generate the summary table grouped by language
-no_paralytic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = no_paralytic_cohort, factorVars = catVars, test = TRUE)
+no_paralytic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | language_category, data = no_paralytic_cohort, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
 save_html(as.tags(no_paralytic_table_one), file = paste0(tables_dir, institution, "_no_paralytic_cohort_table_one_manuscript.html"))
@@ -363,7 +363,7 @@ only_paralytic_cohort$ethnicity_category <- relevel(as.factor(only_paralytic_coh
 
 #Basic Table One
 # Generate the summary table grouped by language
-only_paralytic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = only_paralytic_cohort, factorVars = catVars, test = TRUE)
+only_paralytic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + covid_status | language_category, data = only_paralytic_cohort, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
 save_html(as.tags(only_paralytic_table_one), file = paste0(tables_dir, institution, "_only_paralytic_cohort_table_one_manuscript.html"))
@@ -465,7 +465,7 @@ micu_only_cohort$ethnicity_category <- relevel(as.factor(micu_only_cohort$ethnic
 
 #Basic Table One
 # Generate the summary table grouped by language
-micu_only_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = micu_only_cohort, factorVars = catVars, test = TRUE)
+micu_only_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | language_category, data = micu_only_cohort, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
 save_html(as.tags(micu_only_table_one), file = paste0(tables_dir, institution, "_micu_only_table_one_manuscript.html"))
@@ -484,7 +484,7 @@ hispanic_cohort$ethnicity_category <- relevel(as.factor(hispanic_cohort$ethnicit
 
 #Basic Table One
 # Generate the summary table grouped by language
-hispanic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = hispanic_cohort, factorVars = catVars, test = TRUE)
+hispanic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | language_category, data = hispanic_cohort, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
 save_html(as.tags(hispanic_table_one), file = paste0(tables_dir, institution, "_hispanic_table_one_manuscript.html"))
@@ -503,7 +503,7 @@ non_hispanic_cohort$ethnicity_category <- relevel(as.factor(non_hispanic_cohort$
 
 #Basic Table One
 # Generate the summary table grouped by language
-non_hispanic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = non_hispanic_cohort, factorVars = catVars, test = TRUE)
+non_hispanic_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | language_category, data = non_hispanic_cohort, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
 save_html(as.tags(non_hispanic_table_one), file = paste0(tables_dir, institution, "_non_hispanic_table_one_manuscript.html"))
@@ -536,14 +536,14 @@ language_reclass_cohort$ethnicity_category <- relevel(as.factor(language_reclass
 
 #Basic Table One
 # Generate the summary table grouped by language
-language_reclass_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type + imv_duration_days + thirty_day_mortality | language_category, data = language_reclass_cohort, factorVars = catVars, test = TRUE)
+language_reclass_table_one <- table1(~ age_at_admission + sex_category + ethnicity_category + race_category + bmi + laps2 + hospital_id + icu_type | language_category, data = language_reclass_cohort, factorVars = catVars, test = TRUE)
 
 # Convert to HTML and save as file
 save_html(as.tags(language_reclass_table_one), file = paste0(tables_dir, institution, "_language_reclass_table_one_manuscript.html"))
 
 ```
 
-#Cohort wihout unknown patients
+#Cohort wihout unknown ethnicity patients
 ```{r}
 no_unknown_ethnicity_cohort <- english_spanish_primary_analysis[
   ethnicity_category != "Unknown"
@@ -767,15 +767,15 @@ sensitivity_model_seven <- glm(deep_sedation_weighted ~ language_category + race
 summary(sensitivity_model_seven)
 
 # Extract coefficients and calculate odds ratios, standard errors, and variance
-coef_summary <- summary(sensitivity_model_seven)$coefficients
-odds_ratios <- exp(coef_summary[, "Estimate"])  # Exponentiated coefficients
-standard_errors <- coef_summary[, "Std. Error"]
+coef_summary_seven <- summary(sensitivity_model_seven)$coefficients
+odds_ratios <- exp(coef_summary_seven[, "Estimate"])  # Exponentiated coefficients
+standard_errors <- coef_summary_seven[, "Std. Error"]
 variance <- standard_errors^2  # Calculate variance
-p_values <- coef_summary[, "Pr(>|z|)"]  # Extract p-values
+p_values <- coef_summary_seven[, "Pr(>|z|)"]  # Extract p-values
 
 # Create a data frame to hold the results
 sensitivity_model_seven_results <- data.frame(
-    Variable = rownames(coef_summary),
+    Variable = rownames(coef_summary_seven),
     Odds_Ratio = odds_ratios,
     Std_Error = standard_errors,
     Variance = variance,  # Add variance
@@ -862,11 +862,11 @@ fwrite(kappa_results_sensitivity_2, file = paste0(final_data, institution, "_kap
 #fit <- lm(percent_deep_sedation_48 ~ ethnicity_category + language_category, data = language_reclass_cohort)
 #vif(fit)
 
-library(vcd)
-assocstats(table(no_unknown_ethnicity_cohort$ethnicity_category, no_unknown_ethnicity_cohort$language_category))
+#library(vcd)
+#assocstats(table(no_unknown_ethnicity_cohort$ethnicity_category, no_unknown_ethnicity_cohort$language_category))
 
-eth_lang_table <- table(language_reclass_cohort$ethnicity_category, language_reclass_cohort$language_category)
-fisher.test(eth_lang_table)
+#eth_lang_table <- table(language_reclass_cohort$ethnicity_category, language_reclass_cohort$language_category)
+#fisher.test(eth_lang_table)
 ```
 
 
