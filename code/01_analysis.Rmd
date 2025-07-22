@@ -127,6 +127,13 @@ total_cohort_table_one <- table1(~ age_at_admission + sex_category + ethnicity_c
 
 # Convert to HTML and save as file
 save_html(as.tags(total_cohort_table_one), file = paste0(tables_dir, institution, "_total_cohort_table_one_manuscript.html"))
+
+#Create paralytic_early_flag
+total_cohort[, paralytic_early_flag := fifelse(
+  (time_to_first_paralytic > 0) | (push_paralytics == 1),
+  1, 0)]
+
+setnafill(total_cohort, cols = "paralytic_early_flag", fill = 0)
 ```
 
 # Cohort for Top 5 non-English, non-Spanish Language
@@ -1492,6 +1499,86 @@ secondary_model_opioid_only_results <- data.frame(
 fwrite(secondary_model_opioid_only_results, file = paste0(final_data, institution, "_secondary_analysis_opioid_only.csv"))
 ```
 
+#Secondary Analysis #16: Odds of Any Paralysis on Total Cohort non_eng
+```{r}
+secondary_model_paralysis_non_eng <- glm(paralytic_early_flag ~ non_eng + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2 + covid_status, data = total_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_paralysis_non_eng)
+
+# Extract coefficients and calculate odds ratios, standard errors, and variance
+coef_summary_paralysis_non_eng <- summary(secondary_model_paralysis_non_eng)$coefficients
+odds_ratios <- exp(coef_summary_paralysis_non_eng[, "Estimate"])  # Exponentiated coefficients
+standard_errors <- coef_summary_paralysis_non_eng[, "Std. Error"]
+variance <- standard_errors^2  # Calculate variance
+p_values <- coef_summary_paralysis_non_eng[, "Pr(>|z|)"]  # Extract p-values
+
+# Create a data frame to hold the results
+secondary_model_paralysis_non_eng_results <- data.frame(
+    Variable = rownames(coef_summary_paralysis_non_eng),
+    Odds_Ratio = odds_ratios,
+    Std_Error = standard_errors,
+    Variance = variance,  # Add variance
+    P_Value = p_values    # Add p-values
+)
+
+# Write the results to a CSV file
+fwrite(secondary_model_paralysis_non_eng_results, file = paste0(final_data, institution, "_secondary_analysis_paralysis_non_eng.csv"))
+```
+
+#Secondary Analysis #17: Odds of Any Paralysis Pre-Pandemic
+```{r}
+secondary_model_paralysis_pre_pandemic <- glm(paralytic_early_flag ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2, data = pre_pandemic_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_paralysis_pre_pandemic)
+
+# Extract coefficients and calculate odds ratios, standard errors, and variance
+coef_summary_paralysis_pre_pandemic <- summary(secondary_model_paralysis_pre_pandemic)$coefficients
+odds_ratios <- exp(coef_summary_paralysis_pre_pandemic[, "Estimate"])  # Exponentiated coefficients
+standard_errors <- coef_summary_paralysis_pre_pandemic[, "Std. Error"]
+variance <- standard_errors^2  # Calculate variance
+p_values <- coef_summary_paralysis_pre_pandemic[, "Pr(>|z|)"]  # Extract p-values
+
+# Create a data frame to hold the results
+secondary_model_paralysis_pre_pandemic_results <- data.frame(
+    Variable = rownames(coef_summary_paralysis_pre_pandemic),
+    Odds_Ratio = odds_ratios,
+    Std_Error = standard_errors,
+    Variance = variance,  # Add variance
+    P_Value = p_values    # Add p-values
+)
+
+# Write the results to a CSV file
+fwrite(secondary_model_paralysis_pre_pandemic_results, file = paste0(final_data, institution, "_secondary_analysis_paralysis_pre_pandemic.csv"))
+```
+
+#Secondary Analysis #18: Odds of Any Paralysis Pandemic and Beyond
+```{r}
+secondary_model_paralysis_pandemic <- glm(paralytic_early_flag ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2 + covid_status, data = pandemic_cohort, 
+                                  family = binomial(link = "logit"))
+
+summary(secondary_model_paralysis_pandemic)
+
+# Extract coefficients and calculate odds ratios, standard errors, and variance
+coef_summary_paralysis_pandemic <- summary(secondary_model_paralysis_pandemic)$coefficients
+odds_ratios <- exp(coef_summary_paralysis_pandemic[, "Estimate"])  # Exponentiated coefficients
+standard_errors <- coef_summary_paralysis_pandemic[, "Std. Error"]
+variance <- standard_errors^2  # Calculate variance
+p_values <- coef_summary_paralysis_pandemic[, "Pr(>|z|)"]  # Extract p-values
+
+# Create a data frame to hold the results
+secondary_model_paralysis_pandemic_results <- data.frame(
+    Variable = rownames(coef_summary_paralysis_pandemic),
+    Odds_Ratio = odds_ratios,
+    Std_Error = standard_errors,
+    Variance = variance,  # Add variance
+    P_Value = p_values    # Add p-values
+)
+
+# Write the results to a CSV file
+fwrite(secondary_model_paralysis_pandemic_results, file = paste0(final_data, institution, "_secondary_analysis_paralysis_pandemic.csv"))
+```
 
 #STEP FIVE: SUBGROUP ANALYSES
 #Subgroup Analysis #1: Hispanic Patients
