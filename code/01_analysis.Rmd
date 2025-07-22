@@ -1580,6 +1580,27 @@ secondary_model_paralysis_pandemic_results <- data.frame(
 fwrite(secondary_model_paralysis_pandemic_results, file = paste0(final_data, institution, "_secondary_analysis_paralysis_pandemic.csv"))
 ```
 
+#Secondary Analysis #19: Total time mechnically ventilated with covid
+```{r}
+secondary_model_imv_time_covid <- lm(imv_duration_hours_final ~ language_category + race_category + age_category + bmi + sex_category + factor(hospital_icu_id) + elixhauser_score + SVM_SCORE + laps2 + covid_status,
+               data = english_spanish_primary_analysis)
+
+summary(secondary_model_imv_time_covid)
+
+# Extract coefficients, standard errors, variance, and p-values for the adjusted model
+secondary_model_imv_time_covid_results <- data.frame(
+  term = names(coef(secondary_model_imv_time_covid)),
+  estimate = coef(secondary_model_imv_time_covid),
+  std.error = summary(secondary_model_imv_time_covid)$coefficients[, "Std. Error"],
+  variance = (summary(secondary_model_imv_time_covid)$coefficients[, "Std. Error"])^2,  # Calculate variance
+  p.value = summary(secondary_model_imv_time_covid)$coefficients[, "Pr(>|t|)"]  # Extract p-values
+)
+
+# Save the results to a file
+fwrite(secondary_model_imv_time_covid_results, file = paste0(final_data, institution, "_secondary_analysis_imv_time_covid.csv"))
+
+```
+
 #STEP FIVE: SUBGROUP ANALYSES
 #Subgroup Analysis #1: Hispanic Patients
 ```{r}
