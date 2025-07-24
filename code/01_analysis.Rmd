@@ -34,13 +34,13 @@ library(stringr)
 library(rprojroot)
 
 # Auto-setup working directory based on presence of config/config.yaml in the project root
-project_root <- rprojroot::find_root(rprojroot::has_file("config/config.yaml"))
+project_root <- rprojroot::find_root(rprojroot::has_file("config/CLIF_Deep_Sedation_Language_config.yaml"))
 
 # Set knitr's root directory to the 'config' subfolder
 knitr::opts_knit$set(root.dir = file.path(project_root, "config"))
 
 # Read the YAML config from the config folder
-config <- yaml::read_yaml(file.path(project_root, "config", "config.yaml"))
+config <- yaml::read_yaml(file.path(project_root, "config", "CLIF_Deep_Sedation_Language_config.yaml"))
 
 # Define directories based on YAML configuration
 data_dir <- config$data_dir
