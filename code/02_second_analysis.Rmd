@@ -2,17 +2,17 @@
 # Author: Alex Ortiz, Nick Kuhl
 
 # Setup Step - Setup libraries
-```{r}
+```{r setup}
 # Install Packages
 
-packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack", "broom", "forcats", "gtsummary", "tableone", "sandwich", "lmtest", "vcd", "rsq", "pROC")
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack", "readr", "collapse", "stringr", "rprojroot")
 install_if_missing <- function(package) {
   if (!require(package, character.only = TRUE)) {
     install.packages(package, dependencies = TRUE)
     library(package, character.only = TRUE)
   }
 }
-
+ 
 sapply(packages, install_if_missing)
 
 # Load necessary libraries
@@ -30,18 +30,17 @@ library(htmltools)
 library(MASS)
 library(pscl)
 library(car)
-library(broom)
-library(forcats)
-library(mediation)
-library(gtsummary)
-library(tableone)
-library(sandwich)
-library(lmtest)
-library(vcd)
-library(rsq)
-library(pROC)
+library(stringr)
+library(rprojroot)
 
-config <- yaml::read_yaml("config/config.yaml")
+# Auto-setup working directory based on presence of config/config.yaml in the project root
+project_root <- rprojroot::find_root(rprojroot::has_file("config/config.yaml"))
+
+# Set knitr's root directory to the 'config' subfolder
+knitr::opts_knit$set(root.dir = file.path(project_root, "config"))
+
+# Read the YAML config from the config folder
+config <- yaml::read_yaml(file.path(project_root, "config", "config.yaml"))
 
 # Define directories based on YAML configuration
 data_dir <- config$data_dir
