@@ -2,10 +2,10 @@
 # Author: Alex Ortiz
 
 # PART ZERO: Setup Step - Setup libraries
-```{r setup}
+```{r}
 # Install Packages
 
-packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack", "readr", "collapse", "stringr", "rprojroot")
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack", "readr", "collapse", "stringr", "rprojroot", "jsonlite")
 install_if_missing <- function(package) {
   if (!require(package, character.only = TRUE)) {
     install.packages(package, dependencies = TRUE)
@@ -32,15 +32,10 @@ library(pscl)
 library(car)
 library(stringr)
 library(rprojroot)
-
-# Auto-setup working directory based on presence of config/config.yaml in the project root
-project_root <- rprojroot::find_root(rprojroot::has_file("config/CLIF_Deep_Sedation_Language_config.yaml"))
-
-# Set knitr's root directory to the 'config' subfolder
-knitr::opts_knit$set(root.dir = file.path(project_root, "config"))
+library(jsonlite)
 
 # Read the YAML config from the config folder
-config <- yaml::read_yaml(file.path(project_root, "config", "CLIF_Deep_Sedation_Language_config.yaml"))
+config <- jsonlite::fromJSON("config/CLIF_Deep_Sedation_Language_config.json")
 
 # Define directories based on YAML configuration
 data_dir <- config$data_dir
