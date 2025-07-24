@@ -35,7 +35,11 @@ library(rprojroot)
 library(jsonlite)
 
 # Read the YAML or JSON config from the config folder
-config <- jsonlite::fromJSON("config/CLIF_Deep_Sedation_Language_config.json")
+project_root <- file.path( find_root(rprojroot::has_dir("CLIF_Deep_Sedation_Language")),
+  "CLIF_Deep_Sedation_Language")
+knitr::opts_knit$set(root.dir = file.path(project_root, "config"))
+config <- yaml::read_yaml(file.path(project_root, "config", "CLIF_Deep_Sedation_Language_config.yaml"))
+
 #config <- yaml::read_yaml("config/CLIF_Deep_Sedation_Language_config.yaml")
 
 # Define directories based on YAML configuration
