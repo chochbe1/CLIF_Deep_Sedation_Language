@@ -2,7 +2,7 @@
 # Author: Alex Ortiz
 
 # PART ZERO: Setup Step - Setup libraries
-```{r}
+```{r setup}
 # Install Packages
 
 packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack", "readr", "collapse", "stringr", "rprojroot", "jsonlite")

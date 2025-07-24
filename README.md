@@ -46,8 +46,8 @@ Adults with documented IMV periods >24 hours. There are no date constraints.
 * secondary_project folder - 63 files
 
 ## Detailed Instructions
-1. Update json (or yaml) file in config folder with base directory, location to store project files, file type, and institution
-2. In Rstudio, Set Working Directory to "CLIF_Deep_Sedation_Language/config"
+1. Update yaml (or json) file in config folder with base directory, location to store project files, file type, and institution
+2. In Rstudio, Set Working Directory to "CLIF_Deep_Sedation_Language"
 3. Run [CODE](https://github.com/acortizmd/CLIF_Deep_Sedation_Language/tree/main/code) starting with 00_cohort_id
 4. Deposit results:
 
