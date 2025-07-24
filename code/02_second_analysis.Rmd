@@ -34,8 +34,9 @@ library(stringr)
 library(rprojroot)
 library(jsonlite)
 
-# Read the YAML config from the config folder
+# Read the YAML or JSON config from the config folder
 config <- jsonlite::fromJSON("config/CLIF_Deep_Sedation_Language_config.json")
+#config <- yaml::read_yaml("config/CLIF_Deep_Sedation_Language_config.yaml")
 
 # Define directories based on YAML configuration
 data_dir <- config$data_dir
