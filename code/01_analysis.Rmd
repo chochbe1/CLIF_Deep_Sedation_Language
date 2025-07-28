@@ -5,7 +5,7 @@
 ```{r setup}
 # Install Packages
 
-packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack", "readr", "collapse", "stringr", "rprojroot", "jsonlite", "tableone")
+packages <- c("zoo", "data.table", "dplyr", "lubridate", "tidyr", "fst", "arrow", "table1", "lme4", "metafor", "yaml", "pscl", "MASS", "htmltools", "car", "WeightIt", "MatchIt", "purrr", "survival", "mediation", "cmprsk", "gfoRmula", "nnet", "medflex", "bruceR", "tidyverse", "survey", "ipw", "geepack", "readr", "collapse", "stringr", "rprojroot", "jsonlite", "tableone", "lmtest")
 install_if_missing <- function(package) {
   if (!require(package, character.only = TRUE)) {
     install.packages(package, dependencies = TRUE)
@@ -34,6 +34,7 @@ library(stringr)
 library(rprojroot)
 library(jsonlite)
 library(tableone)
+library(lmtest)
 
 # Read the YAML or JSON config from the config folder
 project_root <- file.path( find_root(rprojroot::has_dir("CLIF_Deep_Sedation_Language")),
