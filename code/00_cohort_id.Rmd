@@ -2357,13 +2357,32 @@ clif_laps2_scores <- df_laps_calc |>
 # LAPS2 Score Final:
 ```{r}
 
-pre_final_cohort_imv_runs <-  part_eleven_imv_runs |>
-  mutate(imv_date = date(begin_imv))
+part_eleven_imv_runs[, imv_date := as.Date(begin_imv)]
+setDT(clif_laps2_scores)
 
-begin_imv_laps2 <- merge(pre_final_cohort_imv_runs, clif_laps2_scores, by = "hospitalization_id", all = TRUE)
+# Step 1: Prioritize Exact Match of imv_date and recorded_date
+exact_match <- merge(
+  part_eleven_imv_runs,
+  clif_laps2_scores,
+  by.x = c("hospitalization_id", "imv_date"),
+  by.y = c("hospitalization_id", "recorded_date"),
+  all.x = TRUE
+)
 
-final_cohort_imv_runs <- begin_imv_laps2 %>%
-  filter(imv_date == recorded_date)
+# Step 2: For unmatched rows, do rolling join with preference for earlier dates
+unmatched <- exact_match[is.na(high_risk)]  
+
+# Join using rolling method (prefer earlier)
+setkey(clif_laps2_scores, hospitalization_id, recorded_date)
+setkey(unmatched, hospitalization_id, imv_date)
+
+roll_join <- clif_laps2_scores[unmatched, roll = -Inf, on = .(hospitalization_id, recorded_date = imv_date)]
+
+# Final: Combine the matched and rolled
+final_cohort_imv_runs <- rbindlist(list(
+  exact_match[!is.na(high_risk)],
+  roll_join
+), use.names = TRUE, fill = TRUE)
 
 #LAPS2 MISSING DATA SUMMARY 
 
