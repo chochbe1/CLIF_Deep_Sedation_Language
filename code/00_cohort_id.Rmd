@@ -61,30 +61,340 @@ for (dir in dirs_to_create) {
 }
 ```
 
-# PART ONE: Upload CLIF Respiratory, Hospitalization, ADT, Patient Tables
+#Fix Hospitalization
 ```{r}
-read_data <- function(file_path, select = NULL) {
+read_data_start <- function(file_path, select = NULL) {
+ # 1) load into dt rather than return immediately
   if (grepl("\\.csv$|\\.csv\\.gz$", file_path)) {
-    # fread handles select = NULL by loading all columns
-    return(fread(file_path, select = select))
+    dt <- fread(file_path, select = select)
   } else if (grepl("\\.parquet$", file_path)) {
-    # Use col_select only if select is not NULL
     if (is.null(select)) {
-      return(arrow::read_parquet(file_path))
+      dt <- arrow::read_parquet(file_path)
     } else {
-      return(arrow::read_parquet(file_path, col_select = all_of(select)))
+      dt <- arrow::read_parquet(file_path, col_select = all_of(select))
     }
   } else if (grepl("\\.fst$", file_path)) {
-    # Use columns only if select is not NULL
     if (is.null(select)) {
-      return(fst::read_fst(file_path))
+      dt <- fst::read_fst(file_path)
     } else {
-      return(fst::read_fst(file_path, columns = all_of(select)))
+      dt <- fst::read_fst(file_path, columns = all_of(select))
     }
   } else {
     stop("Unsupported file format. Only CSV, Parquet, and FST are supported.")
   }
+  
+      # Find all datetime variables containing 'dttm'
+  datetime_vars <- names(dt)[grepl("dttm", names(dt))]
+  
+  local_tz = time_zone
+  print(local_tz)
+  
+  # Check and convert datetime variables
+  for (var in datetime_vars) {
+    
+    # Check if its death_dttm might be a date (if it's still not POSIXct)
+    if (var == "death_dttm" & !inherits(dt[[var]], "POSIXct")) {
+      # Try converting it to datetime at 11:59 PM
+      dt[[var]] <- ymd(dt[[var]]) + hours(23) + minutes(59)
+      
+      # This forces tz to local timezone instead of assume it was previously UTC
+      dt[[var]] <- as.POSIXct(dt[[var]])
+      dt[[var]] <- force_tz(dt[[var]], tzone = local_tz)
+
+      # Attempt to parse datetime using a common format, adjust based on your actual format
+      dt[[var]] <- ymd_hms(dt[[var]], quiet = TRUE)
+      print(var)
+      print(paste("✅", var, "converted to 23:59 in", local_tz, "without time shift"))
+
+      if (!inherits(dt[[var]], "POSIXct")) {
+        
+        dt[[var]] <- as.POSIXct(dt[[var]], tz = local_tz)
+        
+        # Attempt to parse datetime using a common format, adjust based on your actual format
+        dt[[var]] <- ymd_hms(dt[[var]], quiet = TRUE)
+        
+        
+        # Check if it just turned things into NA
+        if (is.na(ffirst(dt[[var]], na.rm = TRUE))) {
+          stop(paste("Conversion failed for:", var,"\n",
+                     "\nPlease look at your clif data for   ", var, 
+                     "\nmake sure its POSIXct format!!"))
+          
+          
+          # Check if conversion failed (if it's still not POSIXct)
+          if (!inherits(dt[[var]], "POSIXct")) {
+            stop(paste("Conversion failed for:", var,"\n",
+                       "\nPlease look at your clif data for   ", var, 
+                       "\nmake sure its POSIXct format!!"))
+          }        
+          
+        }
+        
+      }
+    } else {
+    # If it's already POSIXct, adjust to local timezone
+    dt[[var]] <- with_tz(dt[[var]], tzone = local_tz)
+  }
+    
+    print(paste("Woohoo",var,"is in the correct dttm format!!"))
+  }
+    # Join with cohort data and glimpse the result
+  dt %>% glimpse()
+
+  return(dt)
 }
+
+
+clif_hospitalization_start <- 
+  read_data_start(paste0(data_dir, "clif_hospitalization", file_type)) |> 
+  dplyr::select(hospitalization_id, admission_dttm, discharge_dttm, age_at_admission, patient_id, 
+         # admission_type_name, 
+         # admission_type_category, 
+         discharge_name, discharge_category) |> 
+  # unfactor things to ensure everything is lowercase
+  mutate(across(where(is.factor), as.character)) |> 
+  # get everything to lower
+  mutate(across(where(is_character), str_to_lower)) 
+
+#Create an Hospital Block ID - This is to Identify Continuous Hospitalizations When Patients Are Transferred Between Hospitals in One Health System
+#This code is intended be robust to various ways encounters may be coded in CLIF databases
+hospital_blocks <- clif_hospitalization_start |> 
+  dplyr::select(patient_id, hospitalization_id, admission_dttm, discharge_dttm) |>
+  arrange(patient_id, admission_dttm) |>
+  collect()
+
+#Identify Admissions That Occur Within 3 Hours of a Discharge (Will Consider Those Linked and as Part of One Continuous Encounter)
+#Use Data Table for Speed
+linked_encounters <- setDT(hospital_blocks)
+#Create a Variable for the time of the next admission and time of previous discharge
+linked_encounters[, ':=' (next_admit_dttm = data.table::shift(admission_dttm, n=1, type = "lead")), by = patient_id]
+linked_encounters[, ':=' (prev_dc_dttm = data.table::shift(discharge_dttm, n=1, type = "lag")), by = patient_id]
+#Calculates Time Between Discharge and Next Admit
+linked_encounters[, next_diff_time := difftime(next_admit_dttm, discharge_dttm, units = "hours")]
+linked_encounters[, prev_diff_time := difftime(admission_dttm, prev_dc_dttm, units = "hours")]
+
+#Now Create Variable Indicating a Linked Encounter (next_admit-dc time <6 hours or prev_dc-admint <6 hours)
+linked_encounters[, linked := fcase(
+  (next_diff_time <6 | prev_diff_time <6), 1)]
+#Filter to Only Linked Encounters and number them
+linked_encounters <- linked_encounters[linked==1]
+#This Identifies the First Encounter in a Series of Linked Encounters
+linked_encounters[, first_link := fcase(
+  (rowid(linked)==1 | (next_diff_time<6 & prev_diff_time>6)), 1
+), by = patient_id]
+
+#Now Numbers Encounters, easier in dplyr
+#Filter to Just First Links, Number them and then Remerge with linked encounters
+temp <- as_tibble(linked_encounters) |>
+  filter(first_link==1) |>
+  group_by(patient_id) |>
+  mutate(link_group=row_number()) |>
+  ungroup() |>
+  dplyr::select(hospitalization_id, link_group) 
+linked_encounters <- as_tibble(left_join(linked_encounters, temp)) |>
+  fill(link_group, .direction = c("down")) |>
+  #Create a Variable Indicating Which Number of LIinked Encounter the Encounter is
+  group_by(patient_id, link_group) |>
+  mutate(link_number=row_number()) |>
+  ungroup() |>
+  dplyr::select(hospitalization_id, linked, link_number)
+rm(temp)
+
+#Now Join Back to Hospitalization Table
+clif_hospitalization_start <- clif_hospitalization_start |>
+  left_join(linked_encounters) |>
+  mutate(linked=if_else(is.na(linked), 0, linked)) |>
+  compute()
+
+#Pull Out the Any Linked Encounter that Is NOt the First Encounter and Assign Each Encounter an Encounter Block ID in the Original clif_hospitalization table
+df_link <- clif_hospitalization_start |>
+  filter(link_number>1) |>
+  collect()
+
+clif_hospitalization <- clif_hospitalization_start |>
+  group_by(patient_id) |>
+  arrange(patient_id, admission_dttm) |>
+  #Remove Link Numbers that Are Not First in Link Encounter
+  filter(link_number==1 | is.na(link_number)) |>
+  #Make Encounter Blocks
+  collect() |>
+  mutate(encounter_block=row_number()) |>
+  rowbind(df_link, fill = TRUE) |> #Bring Back in Link Numbers >1
+  group_by(patient_id) |> arrange(patient_id, admission_dttm) |>
+  fill(encounter_block, .direction = "down") |>
+  ungroup()|>
+  #Finally, for Linked Encounters Identify 'Final_admit_date' and 'final_dc_date' which are the first and last dates of a link block
+  group_by(patient_id, encounter_block) |>
+  mutate(final_admission_dttm=fcase(
+    row_number()==1, admission_dttm
+  )) |>
+  mutate(final_discharge_dttm=fcase(
+    row_number()==n(), discharge_dttm
+  )) |>
+  # mutate(final_admission_type_name=fcase(
+  #   row_number()==1, admission_type_name
+  # )) |>
+  mutate(final_discharge_name=fcase(
+    row_number()==n(), discharge_name
+  )) |>
+  # mutate(final_admission_type_category=fcase(
+  #   row_number()==1, admission_type_category
+  # )) |>
+  mutate(final_discharge_category=fcase(
+    row_number()==n(), discharge_category
+  )) |>
+  mutate(clif_hospitalizations_joined_id = cur_group_id()) |> 
+  fill(starts_with("final_"), .direction = 'updown') |>
+  
+  dplyr::select(
+    clif_hospitalizations_joined_id,
+    hospitalization_id,
+    patient_id,
+    encounter_block,
+    age_at_admission,
+    admission_dttm = final_admission_dttm,
+    discharge_dttm = final_discharge_dttm,
+    # admission_type_name = final_admission_type_name,
+    discharge_name = final_discharge_name,
+    # admission_type_category = final_admission_type_category,
+    discharge_category = final_discharge_category
+  ) |> 
+  ungroup() |> 
+  as_arrow_table() |> 
+  collect()
+
+hosp_map <- clif_hospitalization %>%
+  as_tibble() %>% 
+  dplyr::select(
+    old_hosp_id     = hospitalization_id,
+    new_hosp_id     = clif_hospitalizations_joined_id,
+    final_admit     = admission_dttm,
+    final_discharge = discharge_dttm,
+    final_discharge_name = discharge_name,
+    final_discharge_category = discharge_category
+  )
+
+```
+
+# PART ONE: Upload respiratory_support, adt, demographics, and hospitalization
+```{r}
+read_data <- function(file_path, select = NULL) {
+  # 1) load into dt rather than return immediately
+  if (grepl("\\.csv$|\\.csv\\.gz$", file_path)) {
+    dt <- fread(file_path, select = select)
+  } else if (grepl("\\.parquet$", file_path)) {
+    if (is.null(select)) {
+      dt <- arrow::read_parquet(file_path)
+    } else {
+      dt <- arrow::read_parquet(file_path, col_select = all_of(select))
+    }
+  } else if (grepl("\\.fst$", file_path)) {
+    if (is.null(select)) {
+      dt <- fst::read_fst(file_path)
+    } else {
+      dt <- fst::read_fst(file_path, columns = all_of(select))
+    }
+  } else {
+    stop("Unsupported file format. Only CSV, Parquet, and FST are supported.")
+  }
+  
+  # 2) if we already have a hosp_map and this table has hospitalization_id,
+  #    automatically swap in the joined‐encounter ID and block dates
+if (exists("hosp_map", envir = .GlobalEnv) &&
+    "hospitalization_id" %in% names(dt)) {
+
+  # are both admit/discharge in here?
+  has_dates <- all(c("admission_dttm", "discharge_dttm") %in% names(dt))
+
+  if (has_dates) {
+    message("🔄 remapping hosp_id, admit & discharge")
+    dt <- dt %>%
+      left_join(hosp_map, by = c("hospitalization_id" = "old_hosp_id")) %>%
+      mutate(
+        hospitalization_id = coalesce(new_hosp_id, as.integer(hospitalization_id)),
+        admission_dttm     = coalesce(final_admit,     admission_dttm),
+        discharge_dttm     = coalesce(final_discharge, discharge_dttm),
+        discharge_name     = coalesce(final_discharge_name, discharge_name),
+        discharge_category = coalesce(final_discharge_category, discharge_category)
+      ) %>%
+      dplyr::select(-new_hosp_id, -final_admit, -final_discharge) 
+      
+
+  } else {
+    message("🔄 remapping just hosp_id")
+    dt <- dt %>%
+      left_join(hosp_map, by = c("hospitalization_id" = "old_hosp_id")) %>%
+      mutate(
+        hospitalization_id = coalesce(new_hosp_id, as.integer(hospitalization_id))
+      ) %>%
+      dplyr::select(-new_hosp_id, -final_admit, -final_discharge, -final_discharge_name, -final_discharge_category)
+  }
+}
+
+  
+    # Find all datetime variables containing 'dttm'
+  datetime_vars <- names(dt)[grepl("dttm", names(dt))]
+  
+  local_tz = time_zone
+  print(local_tz)
+  
+  # Check and convert datetime variables
+  for (var in datetime_vars) {
+    
+    # Check if its death_dttm might be a date (if it's still not POSIXct)
+    if (var == "death_dttm" & !inherits(dt[[var]], "POSIXct")) {
+      # Try converting it to datetime at 11:59 PM
+      dt[[var]] <- ymd(dt[[var]]) + hours(23) + minutes(59)
+      
+      # This forces tz to local timezone instead of assume it was previously UTC
+      dt[[var]] <- as.POSIXct(dt[[var]])
+      dt[[var]] <- force_tz(dt[[var]], tzone = local_tz)
+
+      # Attempt to parse datetime using a common format, adjust based on your actual format
+      dt[[var]] <- ymd_hms(dt[[var]], quiet = TRUE)
+      print(var)
+      print(paste("✅", var, "converted to 23:59 in", local_tz, "without time shift"))
+
+      if (!inherits(dt[[var]], "POSIXct")) {
+        
+        dt[[var]] <- as.POSIXct(dt[[var]], tz = local_tz)
+        
+        # Attempt to parse datetime using a common format, adjust based on your actual format
+        dt[[var]] <- ymd_hms(dt[[var]], quiet = TRUE)
+        
+        
+        # Check if it just turned things into NA
+        if (is.na(ffirst(dt[[var]], na.rm = TRUE))) {
+          stop(paste("Conversion failed for:", var,"\n",
+                     "\nPlease look at your clif data for   ", var, 
+                     "\nmake sure its POSIXct format!!"))
+          
+          
+          # Check if conversion failed (if it's still not POSIXct)
+          if (!inherits(dt[[var]], "POSIXct")) {
+            stop(paste("Conversion failed for:", var,"\n",
+                       "\nPlease look at your clif data for   ", var, 
+                       "\nmake sure its POSIXct format!!"))
+          }        
+          
+        }
+        
+      }
+    } else {
+    # If it's already POSIXct, adjust to local timezone
+    dt[[var]] <- with_tz(dt[[var]], tzone = local_tz)
+  }
+    
+    print(paste("Woohoo",var,"is in the correct dttm format!!"))
+  }
+  
+  # Join with cohort data and glimpse the result
+  dt %>% glimpse()
+
+  return(dt)
+  
+}
+
 
 
 #Load Raw CLIF Respiratory Support, Hospitalization, Patient, ADT Tables
@@ -103,6 +413,7 @@ adt <- as.data.table(read_data(paste0(data_dir, "clif_adt", file_type), select =
 setorder(adt, hospitalization_id, in_dttm)
 
 ```
+
 
 # PART TWO: Identify IMV Runs of at least 24 hours
 ```{r}
@@ -514,7 +825,7 @@ vitals_all <- as.data.table(read_data(paste0(data_dir, "clif_vitals", file_type)
 #Patient Assessments
 specific_assessment_categories <- c("RASS", "gcs_total")
 patient_assessments <- as.data.table(read_data(paste0(data_dir, "clif_patient_assessments", file_type), select = c("hospitalization_id", "recorded_dttm", "assessment_category", "numerical_value", "categorical_value")))[assessment_category %in% specific_assessment_categories & hospitalization_id %in% part_five_imv_runs$hospitalization_id]
-patient_assessments[, `:=`(hospitalization_id = as.character(hospitalization_id))]
+patient_assessments[, `:=`(hospitalization_id = as.integer(hospitalization_id))]
 patient_assessments <- unique(patient_assessments, by = c("hospitalization_id", "recorded_dttm", "assessment_category"))
 
 ```
