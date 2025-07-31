@@ -2750,7 +2750,7 @@ laps2_missing_percent <- laps2_missing_summary %>%
 final_cohort_imv_runs_reduced <- final_cohort_imv_runs[, .(hospitalization_id, begin_imv, end_imv, admission_dttm, discharge_dttm, hospital_id, icu_type, hospital_icu_id, location_of_intubation, first_location_in_hospital, first_trach_dttm, imv_duration_hours_final, imv_duration_days, age_at_admission, age_category, death_dttm, admission_type_category, discharge_category, sex_category, race_category, ethnicity_category, ethnicity_category_final, SVM_SCORE, language_category, top_five_non_eng_non_spanish, non_eng, elixhauser_score, weight_kg, bmi, trached, reintubation, thirty_day_mortality, vfd_clean, hfd_6m, laps2, deep_sedation_weighted, deep_sedation_unweighted, rass_weighted_avg, rass_below_minus_3_count, median_rass_binary, median_rass_cont, sedation_index_score, mean_gcs, median_gcs, death_during_admission, rass_frequency_hrs, icufd_28, time_to_icu_admission, hfd_28d)]
 
 # Save the Missing results to a file
-fwrite(laps2_missing_summary, file = paste0(final_data, institution, "_laps2_missing_summary.csv"))
+#fwrite(laps2_missing_summary, file = paste0(final_data, institution, "_laps2_missing_summary.csv"))
 fwrite(laps2_missing_percent, file = paste0(final_data, institution, "_laps2_missing_percentages.csv"))
 
 #Save Point
